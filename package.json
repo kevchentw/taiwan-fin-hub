@@ -11,7 +11,6 @@
     "build": "npm run build --workspaces",
     "typecheck": "npm run typecheck --workspaces",
     "dev": "npm run dev -w @taiwan-fin-hub/worker",
-    "deploy:cloudflare": "bash scripts/deploy-cloudflare.sh",
     "deploy": "npm run db:migrate:remote && XDG_CONFIG_HOME=.wrangler-config wrangler deploy",
     "db:migrate:local": "XDG_CONFIG_HOME=.wrangler-config wrangler d1 migrations apply DB --local",
     "db:migrate:remote": "XDG_CONFIG_HOME=.wrangler-config wrangler d1 migrations apply DB --remote"

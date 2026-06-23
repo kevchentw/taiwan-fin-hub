@@ -18,7 +18,7 @@
 
 **步驟二：一鍵部署**
 
-點擊下方按鈕，它會將程式碼 fork 到你的 GitHub 帳號並部署到 Cloudflare Workers：
+點擊下方按鈕，它會將程式碼複製到你的 GitHub 帳號並部署到 Cloudflare Workers：
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kevchentw/taiwan-fin-hub)
 
@@ -50,6 +50,32 @@
 1. 開啟部署完成的網址，確認需要通過 Cloudflare Access 登入才能進入網站（若能直接進入請回到步驟三確認 Restricted 設定）
 2. 登入後到「連接器」頁面設定資料來源
 3. 按同步取得最新資料
+
+
+## 更新
+
+目前 Deploy to Cloudflare 尚不支援 Fork，無法在 GitHub 上快速 sync，請擇一使用以下兩種方式更新：
+
+**方法一：透過 Git 更新（推薦）**
+
+```bash
+git remote add upstream git@github.com:kevchentw/taiwan-fin-hub.git
+git fetch upstream
+git merge upstream/main
+```
+
+推送後 Cloudflare 會自動部署新版本。
+
+**方法二：重新部署**
+
+點擊下方按鈕重新走一次部署流程：
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kevchentw/taiwan-fin-hub)
+
+1. **Project Name** 填新名稱，例如 `taiwan-fin-hub-v2`
+2. **Select D1 Database** 選擇原有的資料庫（`taiwan-fin-hub` 或你自訂的名稱）
+3. **CONFIG_ENCRYPTION_KEY** 若有保留原本的值請填入相同值；填新值則連接器帳密需重新設定
+4. 其餘步驟同首次部署；新版本會有新的 Worker URL，但資料庫沿用原有的，資料不會遺失
 
 
 ## 安全機制

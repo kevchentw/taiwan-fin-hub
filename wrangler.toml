@@ -1,0 +1,12 @@
+name = "taiwan-fin-hub"
+main = "apps/worker/src/index.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+assets = { directory = "apps/web/dist", binding = "ASSETS" }
+browser = { binding = "BROWSER" }
+
+[[d1_databases]]
+binding = "DB"
+database_name = "taiwan-fin-hub"
+migrations_dir = "packages/db/migrations"

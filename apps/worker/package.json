@@ -1,0 +1,29 @@
+{
+  "name": "@taiwan-fin-hub/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "dev": "XDG_CONFIG_HOME=../../.wrangler-config wrangler dev -c wrangler.local.toml",
+    "dev:remote": "XDG_CONFIG_HOME=../../.wrangler-config wrangler dev -c ../../wrangler.toml --remote",
+    "deploy": "npm run build -w @taiwan-fin-hub/web && npm run db:migrate:remote && XDG_CONFIG_HOME=../../.wrangler-config wrangler deploy -c ../../wrangler.toml",
+    "db:migrate:local": "XDG_CONFIG_HOME=../../.wrangler-config wrangler d1 migrations apply DB --local -c wrangler.local.toml",
+    "db:migrate:remote": "XDG_CONFIG_HOME=../../.wrangler-config wrangler d1 migrations apply DB --remote -c ../../wrangler.toml"
+  },
+  "dependencies": {
+    "@cloudflare/puppeteer": "^1.1.0",
+    "@hono/zod-validator": "^0.4.1",
+    "@taiwan-fin-hub/connectors": "0.1.0",
+    "@taiwan-fin-hub/core": "0.1.0",
+    "@taiwan-fin-hub/db": "0.1.0",
+    "hono": "^4.5.8",
+    "jpeg-js": "^0.4.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260621.1",
+    "wrangler": "^4.103.0"
+  }
+}

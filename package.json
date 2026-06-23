@@ -1,0 +1,43 @@
+{
+  "name": "taiwan-fin-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "dev": "npm run dev -w @taiwan-fin-hub/worker",
+    "deploy:cloudflare": "bash scripts/deploy-cloudflare.sh",
+    "deploy": "npm run db:migrate:remote && XDG_CONFIG_HOME=.wrangler-config wrangler deploy",
+    "db:migrate:local": "XDG_CONFIG_HOME=.wrangler-config wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "XDG_CONFIG_HOME=.wrangler-config wrangler d1 migrations apply DB --remote"
+  },
+  "cloudflare": {
+    "bindings": {
+      "CONFIG_ENCRYPTION_KEY": {
+        "description": "用於加密儲存在 D1 的連接器憑證。**請務必修改預設值**，可使用 `openssl rand -hex 32` 產生隨機字串；部署後若更換此金鑰，現有連接器設定將無法解密。"
+      },
+      "TEAM_DOMAIN": {
+        "description": "Cloudflare Access 的 Team Domain，例如 `https://your-team.cloudflareaccess.com`。**部署時可先留空**，待將存取模式切換為「Restricted」後再填入。"
+      },
+      "POLICY_AUD": {
+        "description": "Cloudflare Access 自架應用程式的 AUD Tag。**部署時可先留空**，待將存取模式切換為「Restricted」並建立 Access 應用程式後再填入。"
+      },
+      "DB": {
+        "description": "儲存連接器設定、同步金融資料及資料庫遷移紀錄的 D1 資料庫。"
+      },
+      "BROWSER": {
+        "description": "Cloudflare Browser Rendering binding，供需要瀏覽器的連接器（如玉山銀行）使用。"
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.5.4"
+  }
+}

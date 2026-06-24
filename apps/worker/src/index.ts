@@ -39,6 +39,7 @@ interface Env {
   CONFIG_ENCRYPTION_KEY: string;
   TEAM_DOMAIN: string;
   POLICY_AUD: string;
+  DEMO_MODE?: string;
 }
 
 type Variables = {
@@ -85,7 +86,16 @@ function requireSecrets(env: Env) {
   }
 }
 
+function isDemoMode(env: Env) {
+  return env.DEMO_MODE === "true";
+}
+
 api.use("*", async (c, next) => {
+  if (isDemoMode(c.env)) {
+    await next();
+    return;
+  }
+
   requireSecrets(c.env);
 
   const identity = await verifyAccessIdentity(c.req.raw, c.env);
@@ -105,6 +115,12 @@ api.use("*", async (c, next) => {
   await next();
 });
 
+api.get("/runtime", (c) =>
+  c.json({
+    demoMode: isDemoMode(c.env)
+  })
+);
+
 api.use("/connectors/:connectorId/*", async (c, next) => {
   const connectorId = c.req.param("connectorId");
   if (!isConnectorId(connectorId)) {
@@ -122,6 +138,26 @@ api.use("/connectors/:connectorId/*", async (c, next) => {
 
   c.set("connectorId", connectorId);
   await next();
+});
+
+api.use("/connectors/:connectorId/*", async (c, next) => {
+  const path = new URL(c.req.url).pathname;
+  const isSyncRequest = c.req.method === "POST" && /^\/api\/connectors\/[^/]+\/sync(?:\/|$)/.test(path);
+  if (!isDemoMode(c.env) || !isSyncRequest) {
+    await next();
+    return;
+  }
+
+  return c.json(
+    {
+      success: false,
+      error: {
+        code: "DEMO_MODE",
+        message: "Demo site disables connector sync."
+      }
+    },
+    403
+  );
 });
 
 api.get("/summary", async (c) => {

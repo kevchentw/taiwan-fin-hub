@@ -17,6 +17,7 @@ import {
   Save,
   Search,
   Settings,
+  ShieldAlert,
   Trash2,
   TrendingUp,
   WalletCards
@@ -180,6 +181,10 @@ interface ApiError {
   };
 }
 
+interface RuntimeInfo {
+  demoMode: boolean;
+}
+
 const queryClient = new QueryClient();
 const totalAssetsScopeStorageKey = "taiwan-fin-hub-total-assets-scope";
 const netWorthChartIncludedAssetsStorageKey = "taiwan-fin-hub-net-worth-chart-included-assets";
@@ -239,7 +244,7 @@ function App() {
           </header>
 
           <main className="mx-auto max-w-7xl px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
-            <ApiProvider view={view} onNavigate={setView} />
+            <RuntimeAwareContent view={view} onNavigate={setView} />
           </main>
 
           <footer className="mx-auto max-w-7xl border-t border-ink/8 px-4 py-6 sm:px-6 lg:px-8">
@@ -266,9 +271,45 @@ function App() {
   );
 }
 
-function ApiProvider({ view, onNavigate }: { view: View; onNavigate: (v: View) => void }) {
+function RuntimeAwareContent({ view, onNavigate }: { view: View; onNavigate: (v: View) => void }) {
   const api = useMemo(() => createApiClient(), []);
+  const runtime = useQuery({
+    queryKey: ["runtime"],
+    queryFn: () => api.get<RuntimeInfo>("/api/runtime")
+  });
+  const demoMode = runtime.data?.demoMode === true;
 
+  return (
+    <div className="grid gap-5">
+      {demoMode && <DemoBanner />}
+      <ApiProvider api={api} demoMode={demoMode} view={view} onNavigate={onNavigate} />
+    </div>
+  );
+}
+
+function DemoBanner() {
+  return (
+    <div className="flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+      <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+      <div>
+        <p className="font-medium">Demo site</p>
+        <p className="mt-0.5 text-amber-800">這裡使用示範資料，已停用連接器同步與 Cloudflare Access 登入檢查。</p>
+      </div>
+    </div>
+  );
+}
+
+function ApiProvider({
+  api,
+  demoMode,
+  view,
+  onNavigate
+}: {
+  api: ApiClient;
+  demoMode: boolean;
+  view: View;
+  onNavigate: (v: View) => void;
+}) {
   if (view === "dashboard") {
     return <Dashboard api={api} onNavigate={onNavigate} />;
   }
@@ -297,7 +338,7 @@ function ApiProvider({ view, onNavigate }: { view: View; onNavigate: (v: View) =
     );
   }
 
-  return <SettingsView api={api} />;
+  return <SettingsView api={api} demoMode={demoMode} />;
 }
 
 function Dashboard({ api, onNavigate }: { api: ApiClient; onNavigate: (v: View) => void }) {
@@ -3554,13 +3595,13 @@ function ClassificationRulesPanel({ api }: { api: ApiClient }) {
   );
 }
 
-function SettingsView({ api }: { api: ApiClient }) {
+function SettingsView({ api, demoMode }: { api: ApiClient; demoMode: boolean }) {
   return (
     <div className="grid gap-5">
       <section className="grid gap-5 lg:grid-cols-2">
-        <ConnectorPanel api={api} connectorId="einvoice" title="電子發票" />
-        <ConnectorPanel api={api} connectorId="tdcc" title="集保e存摺" />
-        <ConnectorPanel api={api} connectorId="esun" title="玉山銀行" />
+        <ConnectorPanel api={api} connectorId="einvoice" demoMode={demoMode} title="電子發票" />
+        <ConnectorPanel api={api} connectorId="tdcc" demoMode={demoMode} title="集保e存摺" />
+        <ConnectorPanel api={api} connectorId="esun" demoMode={demoMode} title="玉山銀行" />
         <ExchangeRatesPanel api={api} />
         <ClassificationRulesPanel api={api} />
       </section>
@@ -3571,10 +3612,12 @@ function SettingsView({ api }: { api: ApiClient }) {
 function ConnectorPanel({
   api,
   connectorId,
+  demoMode,
   title
 }: {
   api: ApiClient;
   connectorId: ConnectorId;
+  demoMode: boolean;
   title: string;
 }) {
   const queryClient = useQueryClient();
@@ -3653,11 +3696,15 @@ function ConnectorPanel({
   }
 
   const sync = useMutation({
-    mutationFn: (target: SyncTarget = "default") =>
-      api.post<{ success: true; records: number; detailRecords?: number; cursorUpdated: boolean }>(
+    mutationFn: (target: SyncTarget = "default") => {
+      if (demoMode) {
+        throw new Error("Demo site 已停用連接器同步。");
+      }
+      return api.post<{ success: true; records: number; detailRecords?: number; cursorUpdated: boolean }>(
         syncPath(target),
         connectorId === "einvoice" ? { fetchDetails: true } : undefined
-      ),
+      );
+    },
     onMutate: (target) => {
       setError("");
       setPendingSyncTarget(target ?? "default");
@@ -3671,6 +3718,9 @@ function ConnectorPanel({
   const verifyOtp = useMutation({
     mutationFn: async () => {
       setError("");
+      if (demoMode) {
+        throw new Error("Demo site 已停用連接器同步。");
+      }
       if (!otp.trim()) {
         throw new Error("請先輸入驗證碼。");
       }
@@ -3708,18 +3758,21 @@ function ConnectorPanel({
                 label="同步投資"
                 icon={<WalletCards />}
                 busy={sync.isPending && pendingSyncTarget === "investments"}
+                disabled={demoMode}
                 onClick={() => sync.mutate("investments")}
               />
               <IconButton
                 label="同步銀行"
                 icon={<CreditCard />}
                 busy={sync.isPending && pendingSyncTarget === "bank"}
+                disabled={demoMode}
                 onClick={() => sync.mutate("bank")}
               />
               <IconButton
                 label="同步交易"
                 icon={<Database />}
                 busy={sync.isPending && pendingSyncTarget === "trades"}
+                disabled={demoMode}
                 onClick={() => sync.mutate("trades")}
               />
             </>
@@ -3728,14 +3781,20 @@ function ConnectorPanel({
               label="同步"
               icon={<RefreshCw />}
               busy={sync.isPending}
+              disabled={demoMode}
               onClick={() => sync.mutate("default")}
             />
           )}
           {connectorId === "tdcc" && !otpRequired && (
-            <IconButton label="輸入 OTP" icon={<KeyRound />} busy={false} onClick={() => setOtpForced(true)} />
+            <IconButton label="輸入 OTP" icon={<KeyRound />} busy={false} disabled={demoMode} onClick={() => setOtpForced(true)} />
           )}
         </div>
       </div>
+      {demoMode && (
+        <p className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          Demo site 已停用同步；你仍可查看示範資料與介面互動。
+        </p>
+      )}
       {connectorId === "tdcc" && (
         <details className="mt-3 rounded-md border border-ink/10 bg-paper text-sm text-ink/70" open>
           <summary className="cursor-pointer select-none px-3 py-2 font-medium text-ink/80">使用說明</summary>
@@ -3875,17 +3934,19 @@ function IconButton({
   label,
   icon,
   busy,
+  disabled = false,
   onClick
 }: {
   label: string;
   icon: ReactNode;
   busy: boolean;
+  disabled?: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       className="inline-flex h-9 items-center justify-center gap-2 rounded-lg bg-steel px-3 text-sm font-medium text-white transition hover:bg-steel/90 disabled:cursor-not-allowed disabled:opacity-60"
-      disabled={busy}
+      disabled={busy || disabled}
       onClick={onClick}
       title={label}
       type="button"

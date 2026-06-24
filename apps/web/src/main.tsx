@@ -3241,7 +3241,7 @@ const connectorFields: Record<ConnectorId, ConnectorField[]> = {
   einvoice: [
     { key: "mobile", label: "手機號碼", type: "text", placeholder: "0912345678" },
     { key: "password", label: "密碼", type: "password" },
-    { key: "apiKey", label: "API 金鑰", type: "password" },
+    { key: "apiKey", label: "API 金鑰 (不需填寫)", type: "password" },
     { key: "periodsBack", label: "回溯期數", type: "number", placeholder: "1" },
     { key: "fetchDetails", label: "同步明細", type: "checkbox" }
   ],

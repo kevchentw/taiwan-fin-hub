@@ -9,6 +9,9 @@ preview_urls = false
 assets = { directory = "apps/web/dist", binding = "ASSETS" }
 browser = { binding = "BROWSER" }
 
+[triggers]
+crons = ["*/10 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "taiwan-fin-hub"

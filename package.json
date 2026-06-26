@@ -26,6 +26,9 @@
       "POLICY_AUD": {
         "description": "Cloudflare Access 自架應用程式的 AUD Tag。**部署時可先留空**，待將存取模式切換為「Restricted」並建立 Access 應用程式後再填入。"
       },
+      "POLICY_AUDS": {
+        "description": "(開發用) 多個 Cloudflare Access AUD Tag，使用逗號或空白分隔；可用來讓同一個 Worker 接受 production/private 等多個 Access Application 的 JWT。"
+      },
       "DEMO_MODE": {
         "description": "設為 `true`、`1`、`yes` 或 `on` 可啟用公開唯讀 Demo 模式；Demo 模式不需要 `TEAM_DOMAIN`、`POLICY_AUD` 或 `CONFIG_ENCRYPTION_KEY`。"
       },

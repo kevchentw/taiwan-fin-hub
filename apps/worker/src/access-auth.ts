@@ -1,6 +1,7 @@
 export interface AccessAuthEnv {
   TEAM_DOMAIN: string;
-  POLICY_AUD: string;
+  POLICY_AUD?: string;
+  POLICY_AUDS?: string;
 }
 
 type AccessJwtPayload = {
@@ -90,7 +91,7 @@ async function verifyAccessJwt(token: string, env: AccessAuthEnv) {
 
   const now = Math.floor(Date.now() / 1000);
   if (payload.iss !== teamDomain) throw new Error("Invalid JWT issuer.");
-  if (!audienceMatches(payload.aud, env.POLICY_AUD)) throw new Error("Invalid JWT audience.");
+  if (!audienceMatches(payload.aud, acceptedAudiences(env))) throw new Error("Invalid JWT audience.");
   if (typeof payload.exp !== "number" || payload.exp <= now) throw new Error("Expired JWT.");
   if (typeof payload.nbf === "number" && payload.nbf > now) throw new Error("JWT not valid yet.");
 
@@ -121,8 +122,21 @@ function normalizeTeamDomain(value: string) {
   return trimmed.startsWith("https://") ? trimmed : `https://${trimmed}`;
 }
 
-function audienceMatches(aud: string | string[] | undefined, expected: string) {
-  return Array.isArray(aud) ? aud.includes(expected) : aud === expected;
+function acceptedAudiences(env: AccessAuthEnv) {
+  const values = [env.POLICY_AUD, env.POLICY_AUDS]
+    .flatMap((value) => value?.split(/[\s,]+/) ?? [])
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+
+  if (values.length === 0) throw new Error("No JWT audiences configured.");
+
+  return values;
+}
+
+function audienceMatches(aud: string | string[] | undefined, expected: string[]) {
+  if (!aud) return false;
+  const actual = Array.isArray(aud) ? aud : [aud];
+  return actual.some((value) => expected.includes(value));
 }
 
 function decodeBase64UrlToString(value: string) {

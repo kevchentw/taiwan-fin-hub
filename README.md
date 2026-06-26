@@ -8,6 +8,7 @@
    - 支援銀行列表：https://epassbook.tdcc.com.tw/zh/g1.aspx
 2. 電子發票載具
 3. 玉山銀行
+4. 國泰銀行
 
 | 總覽 | 投資 | 銀行 |
 |---|---|---|
@@ -70,6 +71,7 @@
 | --- | --- |
 | `TEAM_DOMAIN` | JWKs URL 的網域，例如 `https://yourteam.cloudflareaccess.com` |
 | `POLICY_AUD` | Audience (aud) 的 hex 值 |
+| `POLICY_AUDS` | 選填，多個 Audience (aud) 的 hex 值，以逗號或空白分隔 |
 
 ---
 
@@ -117,6 +119,14 @@ git merge upstream/main
 1. 從 Cloudflare Access JWKS 端點取得公鑰（`/cdn-cgi/access/certs`）
 2. 以 **RS256（RSA + SHA-256）** 驗證 JWT 簽章
 3. 確認 issuer、audience 正確且 JWT 未過期
+
+若同一個 Worker 需要接受多個 Cloudflare Access Application 的 JWT，可設定 `POLICY_AUDS`，例如：
+
+```env
+POLICY_AUDS=production-aud-hex,private-aud-hex
+```
+
+`POLICY_AUD` 仍可保留作為單一 audience 設定；兩者同時存在時，任一 audience 符合即通過驗證。
 
 驗證失敗一律回傳 `401`。
 

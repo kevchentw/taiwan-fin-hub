@@ -11,6 +11,10 @@ export { esunConfigSchema, parseEsunConfig } from "./esun";
 export type { EsunConfig } from "./esun";
 import { esunConfigSchema } from "./esun";
 
+export { cathaybkConfigSchema, parseCathaybkConfig } from "./cathaybk";
+export type { CathaybkConfig } from "./cathaybk";
+import { cathaybkConfigSchema } from "./cathaybk";
+
 const invoiceRecordSchema = z.object({
   sourceId: z.string().min(1),
   invoiceNumber: z.string().optional(),
@@ -245,6 +249,10 @@ export function parseConnectorConfig(connectorId: string, config: unknown) {
 
   if (connectorId === "esun") {
     return esunConfigSchema.parse(config);
+  }
+
+  if (connectorId === "cathaybk") {
+    return cathaybkConfigSchema.parse(config);
   }
 
   throw new Error("Unsupported connector id.");

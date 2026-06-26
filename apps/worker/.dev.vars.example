@@ -1,4 +1,6 @@
 CONFIG_ENCRYPTION_KEY=replace-with-at-least-32-random-characters
 TEAM_DOMAIN=https://your-team.cloudflareaccess.com
 POLICY_AUD=replace-with-cloudflare-access-application-audience-tag
+# Optional: comma- or whitespace-separated additional audience tags.
+POLICY_AUDS=
 DEMO_MODE=false

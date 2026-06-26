@@ -1,6 +1,7 @@
 import {
   einvoiceConnector,
   parseConnectorConfig,
+  parseCathaybkConfig,
   parseEsunConfig,
   parseInvoiceConfig,
   parseTdccConfig,
@@ -8,6 +9,7 @@ import {
   tdccConnector,
   TdccOtpExpiredError
 } from "@taiwan-fin-hub/connectors";
+import { createCathaybkConnector } from "./cathaybk";
 import { createEsunConnector } from "./esun";
 import {
   type BankAccount,
@@ -39,6 +41,7 @@ interface Env {
   CONFIG_ENCRYPTION_KEY?: string;
   TEAM_DOMAIN?: string;
   POLICY_AUD?: string;
+  POLICY_AUDS?: string;
   DEMO_MODE?: string | boolean;
 }
 
@@ -80,9 +83,9 @@ function jsonError(code: string, message: string, status = 400) {
   );
 }
 
-function requireAccessSecrets(env: Env): asserts env is Env & { TEAM_DOMAIN: string; POLICY_AUD: string } {
-  if (!env.TEAM_DOMAIN || !env.POLICY_AUD) {
-    throw new Error("TEAM_DOMAIN and POLICY_AUD are required unless DEMO_MODE is enabled.");
+function requireAccessSecrets(env: Env): asserts env is Env & { TEAM_DOMAIN: string } {
+  if (!env.TEAM_DOMAIN || (!env.POLICY_AUD && !env.POLICY_AUDS)) {
+    throw new Error("TEAM_DOMAIN and POLICY_AUD or POLICY_AUDS are required unless DEMO_MODE is enabled.");
   }
 }
 
@@ -1030,6 +1033,59 @@ api.post("/connectors/esun/sync", async (c) => {
   });
 });
 
+api.post("/connectors/cathaybk/sync", async (c) => {
+  const settings = await getConnectorSettings(c.env.DB, "cathaybk");
+  if (!settings) {
+    return c.json(
+      { success: false, error: { code: "CONNECTOR_CONFIG_MISSING", message: "Connector settings are required before sync." } },
+      400
+    );
+  }
+
+  const encryptionKey = configEncryptionKey(c.env);
+  const stored = await decryptJson<unknown>(settings.encrypted_config, encryptionKey);
+  const config = parseCathaybkConfig(stored);
+
+  console.log(`[sync] cathaybk: starting (cursor=${settings.sync_cursor ?? "none"})`);
+  const result = await createCathaybkConnector(c.env.BROWSER).sync(config, settings.sync_cursor ?? undefined);
+
+  const bankAccounts = result.bankAccounts ?? [];
+  const bankBalanceSnapshots = result.bankBalanceSnapshots ?? [];
+  const bankTransactions = result.bankTransactions ?? [];
+  console.log(`[sync] cathaybk: accounts=${bankAccounts.length} snapshots=${bankBalanceSnapshots.length} transactions=${bankTransactions.length}`);
+
+  const now = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    ...bankAccounts.map((a) => bankAccountStatement(c.env.DB, "cathaybk", a, now)),
+    ...bankBalanceSnapshots.map((s) => bankBalanceSnapshotStatement(c.env.DB, "cathaybk", s, now)),
+    ...bankTransactions.map((t) => bankTransactionStatement(c.env.DB, "cathaybk", t, now)),
+    ...(bankAccounts.length > 0 ? [linkCanonicalBankAccountsStatement(c.env.DB)] : [])
+  ];
+
+  if (result.cursor) {
+    const cursorState = JSON.parse(result.cursor) as Record<string, unknown>;
+    const updatedConfig = { ...config, ...cursorState };
+    statements.push(
+      c.env.DB.prepare(`UPDATE connector_settings SET encrypted_config = ?, sync_cursor = ?, updated_at = ? WHERE connector_id = ?`)
+        .bind(await encryptJson(updatedConfig, encryptionKey), result.cursor, now, "cathaybk")
+    );
+  }
+
+  if (statements.length > 0) {
+    await c.env.DB.batch(statements);
+  }
+
+  if (bankBalanceSnapshots.length > 0) {
+    await rebuildBankDepositHistory(c.env.DB, [dateFromIso(now)]);
+  }
+
+  return c.json({
+    success: true,
+    records: bankAccounts.length + bankBalanceSnapshots.length + bankTransactions.length,
+    cursorUpdated: Boolean(result.cursor && result.cursor !== settings.sync_cursor)
+  });
+});
+
 async function syncTdccRecords<TConfig>(
   c: Context<{ Bindings: Env; Variables: Variables }>,
   connectorId: "tdcc",
@@ -1288,6 +1344,7 @@ function invoiceLineItemStatement(
 // account when it's synced both directly and via TDCC. TDCC may mask the account
 // number, so only trailing digits are used from the account segment.
 const ESUN_BANK_CODE = "808";
+const CATHAYBK_BANK_CODE = "013";
 const TAIWAN_BANK_NAMES: Record<string, string> = {
   "004": "台灣銀行",
   "005": "土地銀行",
@@ -1340,6 +1397,10 @@ function deriveBankMatchKey(connectorId: ConnectorId, sourceId: string): { bankC
     const last4 = sourceId.split(":")[2]?.replace(/\D/g, "").slice(-4) ?? "";
     return { bankCode: ESUN_BANK_CODE, last4: last4 || null };
   }
+  if (connectorId === "cathaybk" && sourceId.startsWith("bank:cathaybk:")) {
+    const last4 = sourceId.split(":")[2]?.replace(/\D/g, "").slice(-4) ?? "";
+    return { bankCode: CATHAYBK_BANK_CODE, last4: last4 || null };
+  }
   const match = sourceId.match(/^settlement:([^:]+):([^:]+)/);
   const last4 = match?.[2]?.replace(/\D/g, "").slice(-4) ?? "";
   return match ? { bankCode: match[1], last4: last4 || null } : { bankCode: null, last4: null };
@@ -1358,7 +1419,10 @@ function normalizeBankTransactionDisplay<T extends BankDisplayRow>(row: T): T {
 function normalizeDepositDisplay<T extends BankDisplayRow>(row: T): T {
   const sourceId = row.accountSourceId ?? row.sourceId ?? "";
   const settlement = parseBankAccountSource(sourceId);
-  const bankCode = row.bankCode ?? settlement.bankCode ?? (row.connectorId === "esun" ? ESUN_BANK_CODE : undefined);
+  const bankCode =
+    row.bankCode ??
+    settlement.bankCode ??
+    (row.connectorId === "esun" ? ESUN_BANK_CODE : row.connectorId === "cathaybk" ? CATHAYBK_BANK_CODE : undefined);
   const accountLast5 = accountLast5FromSourceId(sourceId);
 
   return {
@@ -1374,6 +1438,9 @@ function parseBankAccountSource(sourceId: string): { bankCode?: string; account?
 
   const esun = sourceId.match(/^bank:esun:([^:]+)/);
   if (esun) return { bankCode: ESUN_BANK_CODE, account: esun[1] };
+
+  const cathaybk = sourceId.match(/^bank:cathaybk:([^:]+)/);
+  if (cathaybk) return { bankCode: CATHAYBK_BANK_CODE, account: cathaybk[1] };
 
   return {};
 }
@@ -1433,20 +1500,19 @@ function bankAccountStatement(
     );
 }
 
-// ponytail: esun is the only direct-bank connector today, so it always wins as canonical.
-// If a second direct-bank connector is added, this needs a real priority order instead.
 function linkCanonicalBankAccountsStatement(db: D1Database) {
   return db.prepare(
     `UPDATE bank_accounts
     SET canonical_account_id = (
-      SELECT esun.id FROM bank_accounts esun
-      WHERE esun.connector_id = 'esun'
-        AND esun.bank_code = bank_accounts.bank_code
-        AND esun.account_last4 = bank_accounts.account_last4
-        AND esun.currency = bank_accounts.currency
+      SELECT direct.id FROM bank_accounts direct
+      WHERE direct.connector_id IN ('esun', 'cathaybk')
+        AND direct.bank_code = bank_accounts.bank_code
+        AND direct.account_last4 = bank_accounts.account_last4
+        AND direct.currency = bank_accounts.currency
+      ORDER BY direct.connector_id  -- deterministic tiebreak
       LIMIT 1
     )
-    WHERE connector_id != 'esun' AND bank_code IS NOT NULL AND account_last4 IS NOT NULL`
+    WHERE connector_id NOT IN ('esun', 'cathaybk') AND bank_code IS NOT NULL AND account_last4 IS NOT NULL`
   );
 }
 

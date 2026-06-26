@@ -26,6 +26,7 @@ import {
 import {
   getConnectorSettings,
   updateConnectorCursor,
+  updateConnectorPublicConfig,
   upsertConnectorSettings
 } from "@taiwan-fin-hub/db";
 import { Hono, type Context } from "hono";
@@ -55,6 +56,12 @@ const api = new Hono<{ Bindings: Env; Variables: Variables }>();
 const settingsBodySchema = z.object({
   config: z.unknown()
 });
+
+const PUBLIC_FIELDS: Record<string, string[]> = {
+  esun: ["lookbackMonths"],
+  cathaybk: ["lookbackMonths"],
+  einvoice: ["periodsBack", "fetchDetails"]
+};
 
 const tdccSyncBodySchema = z.object({
   otp: z.string().min(1).optional(),
@@ -809,7 +816,8 @@ api.get("/connectors/:connectorId/settings", async (c) => {
   return c.json({
     connectorId,
     configured: Boolean(settings),
-    updatedAt: settings?.updated_at
+    updatedAt: settings?.updated_at,
+    publicConfig: settings?.public_config ? JSON.parse(settings.public_config) : null
   });
 });
 
@@ -829,31 +837,54 @@ api.put("/connectors/:connectorId/settings", async (c) => {
     );
   }
 
-  let parsedConfig: unknown;
-  try {
-    parsedConfig = parseConnectorConfig(connectorId, body.data.config);
-  } catch {
-    return c.json(
-      {
-        success: false,
-        error: {
-          code: "INVALID_CONNECTOR_CONFIG",
-          message: "Connector config does not match the expected shape."
-        }
-      },
-      400
-    );
+  const rawConfig = body.data.config as Record<string, unknown>;
+  const publicKeys = PUBLIC_FIELDS[connectorId] ?? [];
+  const publicConfig: Record<string, unknown> = {};
+  const sensitiveConfig: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(rawConfig)) {
+    if (publicKeys.includes(k)) publicConfig[k] = v;
+    else sensitiveConfig[k] = v;
   }
+  const hasSensitive = Object.values(sensitiveConfig).some((v) => v !== undefined && v !== "");
 
   const now = new Date().toISOString();
   const encryptionKey = configEncryptionKey(c.env);
-  const encryptedConfig = await encryptJson(parsedConfig, encryptionKey);
-  await upsertConnectorSettings(c.env.DB, {
-    id: crypto.randomUUID(),
-    connectorId,
-    encryptedConfig,
-    now
-  });
+  const publicConfigJson = Object.keys(publicConfig).length > 0 ? JSON.stringify(publicConfig) : null;
+
+  if (hasSensitive) {
+    let parsedConfig: unknown;
+    try {
+      const existing = await getConnectorSettings(c.env.DB, connectorId);
+      const storedPublic = existing?.public_config ? JSON.parse(existing.public_config) : {};
+      parsedConfig = parseConnectorConfig(connectorId, { ...storedPublic, ...rawConfig });
+    } catch {
+      return c.json(
+        {
+          success: false,
+          error: {
+            code: "INVALID_CONNECTOR_CONFIG",
+            message: "Connector config does not match the expected shape."
+          }
+        },
+        400
+      );
+    }
+    const encryptedConfig = await encryptJson(parsedConfig, encryptionKey);
+    await upsertConnectorSettings(c.env.DB, {
+      id: crypto.randomUUID(),
+      connectorId,
+      encryptedConfig,
+      publicConfig: publicConfigJson,
+      now
+    });
+  } else {
+    const existing = await getConnectorSettings(c.env.DB, connectorId);
+    if (!existing) {
+      return c.json({ success: false, error: { code: "CONNECTOR_CONFIG_MISSING", message: "Cannot update public config before credentials are set." } }, 400);
+    }
+    const mergedPublic = { ...JSON.parse(existing.public_config ?? "{}"), ...publicConfig };
+    await updateConnectorPublicConfig(c.env.DB, connectorId, JSON.stringify(mergedPublic), now);
+  }
 
   return c.json({
     connectorId,
@@ -991,7 +1022,8 @@ api.post("/connectors/esun/sync", async (c) => {
 
   const encryptionKey = configEncryptionKey(c.env);
   const stored = await decryptJson<unknown>(settings.encrypted_config, encryptionKey);
-  const config = parseEsunConfig(stored);
+  const publicStored = settings.public_config ? JSON.parse(settings.public_config) : {};
+  const config = parseEsunConfig({ ...(stored as object), ...publicStored });
 
   console.log(`[sync] esun: starting (cursor=${settings.sync_cursor ?? "none"})`);
   const result = await createEsunConnector(c.env.BROWSER).sync(config, settings.sync_cursor ?? undefined);
@@ -1044,7 +1076,8 @@ api.post("/connectors/cathaybk/sync", async (c) => {
 
   const encryptionKey = configEncryptionKey(c.env);
   const stored = await decryptJson<unknown>(settings.encrypted_config, encryptionKey);
-  const config = parseCathaybkConfig(stored);
+  const publicStoredCathaybk = settings.public_config ? JSON.parse(settings.public_config) : {};
+  const config = parseCathaybkConfig({ ...(stored as object), ...publicStoredCathaybk });
 
   console.log(`[sync] cathaybk: starting (cursor=${settings.sync_cursor ?? "none"})`);
   const result = await createCathaybkConnector(c.env.BROWSER).sync(config, settings.sync_cursor ?? undefined);
@@ -1132,6 +1165,7 @@ async function syncTdccRecords<TConfig>(
         id: settings.id,
         connectorId,
         encryptedConfig: await encryptJson(configWithoutOtp, encryptionKey),
+        publicConfig: settings.public_config ?? null,
         now: new Date().toISOString()
       });
       console.log(`[sync] ${connectorId}/${syncScope}: cleared expired otp from config`);
@@ -1216,6 +1250,7 @@ async function syncTdccTradeRecords(c: Context<{ Bindings: Env; Variables: Varia
         id: settings.id,
         connectorId,
         encryptedConfig: await encryptJson(configWithoutOtp, encryptionKey),
+        publicConfig: settings.public_config ?? null,
         now: new Date().toISOString()
       });
       console.log("[sync] tdcc/trades: cleared expired otp from config");
@@ -1468,17 +1503,19 @@ function bankAccountStatement(
         account_name,
         account_type,
         currency,
+        credit_limit,
         bank_code,
         account_last4,
         raw_payload,
         created_at,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(connector_id, source_id) DO UPDATE SET
         institution_name = excluded.institution_name,
         account_name = excluded.account_name,
         account_type = excluded.account_type,
         currency = excluded.currency,
+        credit_limit = excluded.credit_limit,
         bank_code = excluded.bank_code,
         account_last4 = excluded.account_last4,
         raw_payload = excluded.raw_payload,
@@ -1492,6 +1529,7 @@ function bankAccountStatement(
       account.accountName ?? null,
       account.accountType ?? null,
       account.currency || "TWD",
+      account.creditLimit ?? null,
       bankCode,
       last4,
       JSON.stringify(account.raw ?? account),
@@ -1532,15 +1570,21 @@ function bankBalanceSnapshotStatement(
         source_id,
         balance,
         available_balance,
+        statement_balance,
+        payment_due_date,
+        no_payment_needed,
         currency,
         as_of_at,
         raw_payload,
         created_at,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(connector_id, account_id, source_id) DO UPDATE SET
         balance = excluded.balance,
         available_balance = excluded.available_balance,
+        statement_balance = excluded.statement_balance,
+        payment_due_date = excluded.payment_due_date,
+        no_payment_needed = excluded.no_payment_needed,
         currency = excluded.currency,
         as_of_at = excluded.as_of_at,
         raw_payload = excluded.raw_payload,
@@ -1553,6 +1597,9 @@ function bankBalanceSnapshotStatement(
       snapshot.sourceId,
       snapshot.balance,
       snapshot.availableBalance ?? null,
+      snapshot.statementBalance ?? null,
+      snapshot.paymentDueDate ?? null,
+      snapshot.noPaymentNeeded == null ? null : (snapshot.noPaymentNeeded ? 1 : 0),
       snapshot.currency || "TWD",
       snapshot.asOfAt,
       JSON.stringify(snapshot.raw ?? snapshot),

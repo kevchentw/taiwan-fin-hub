@@ -2,6 +2,7 @@ export interface ConnectorSettingsRow {
   id: string;
   connector_id: string;
   encrypted_config: string;
+  public_config: string | null;
   sync_cursor: string | null;
   created_at: string;
   updated_at: string;
@@ -20,6 +21,7 @@ export async function upsertConnectorSettings(
     id: string;
     connectorId: string;
     encryptedConfig: string;
+    publicConfig: string | null;
     now: string;
   }
 ) {
@@ -29,14 +31,32 @@ export async function upsertConnectorSettings(
         id,
         connector_id,
         encrypted_config,
+        public_config,
         created_at,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(connector_id) DO UPDATE SET
         encrypted_config = excluded.encrypted_config,
+        public_config = excluded.public_config,
         updated_at = excluded.updated_at`
     )
-    .bind(input.id, input.connectorId, input.encryptedConfig, input.now, input.now)
+    .bind(input.id, input.connectorId, input.encryptedConfig, input.publicConfig, input.now, input.now)
+    .run();
+}
+
+export async function updateConnectorPublicConfig(
+  db: D1Database,
+  connectorId: string,
+  publicConfig: string,
+  now: string
+) {
+  await db
+    .prepare(
+      `UPDATE connector_settings
+      SET public_config = ?, updated_at = ?
+      WHERE connector_id = ?`
+    )
+    .bind(publicConfig, now, connectorId)
     .run();
 }
 

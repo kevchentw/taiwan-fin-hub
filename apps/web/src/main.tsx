@@ -22,7 +22,7 @@ import {
   TrendingUp,
   WalletCards
 } from "lucide-react";
-import { type ReactNode, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -171,6 +171,7 @@ interface ConnectorSettings {
   connectorId: ConnectorId;
   configured: boolean;
   updatedAt?: string;
+  publicConfig?: Record<string, unknown> | null;
 }
 
 interface ApiError {
@@ -3309,13 +3310,14 @@ const connectorFields: Record<ConnectorId, ConnectorField[]> = {
   esun: [
     { key: "userId", label: "身分證字號", type: "text", placeholder: "A123456789" },
     { key: "account", label: "使用者名稱", type: "text" },
-    { key: "password", label: "密碼", type: "password" }
+    { key: "password", label: "密碼", type: "password" },
+    { key: "lookbackMonths", label: "查詢期間（月）", type: "number", placeholder: "1（最多 24）" }
   ],
   cathaybk: [
     { key: "userId", label: "身分證字號", type: "text", placeholder: "A123456789" },
     { key: "account", label: "用戶代號", type: "text" },
     { key: "password", label: "網銀密碼", type: "password" },
-    { key: "lookbackDays", label: "查詢期間（天）", type: "number", placeholder: "30（最多 365）" }
+    { key: "lookbackMonths", label: "查詢期間（月）", type: "number", placeholder: "1（最多 24）" }
   ]
 };
 
@@ -3642,6 +3644,20 @@ function ConnectorPanel({
     queryKey: ["connector-settings", connectorId],
     queryFn: () => api.get<ConnectorSettings>(`/api/connectors/${connectorId}/settings`)
   });
+
+  useEffect(() => {
+    const pub = settings.data?.publicConfig;
+    if (!pub) return;
+    setValues((current) => {
+      const next = { ...current };
+      for (const field of fields) {
+        if (field.key in pub && next[field.key] === undefined) {
+          next[field.key] = String(pub[field.key] ?? "");
+        }
+      }
+      return next;
+    });
+  }, [settings.data?.publicConfig]);
 
   function setValue(key: string, value: string | boolean) {
     setValues((current) => ({ ...current, [key]: value }));

@@ -103,6 +103,7 @@ export interface BankAccount {
   accountName?: string;
   accountType?: BankAccountType;
   currency: string;
+  creditLimit?: number;
   raw?: unknown;
 }
 
@@ -113,6 +114,9 @@ export interface BankBalanceSnapshot {
   sourceId: string;
   balance: number;
   availableBalance?: number;
+  statementBalance?: number;
+  paymentDueDate?: string;
+  noPaymentNeeded?: boolean;
   currency: string;
   asOfAt: string;
   raw?: unknown;

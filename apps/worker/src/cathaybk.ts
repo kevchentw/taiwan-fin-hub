@@ -53,7 +53,7 @@ async function scrapeWithBrowser(browserBinding: Fetcher, config: CathaybkConfig
   console.log("[cathaybk] launching browser");
   const b = await puppeteer.launch(browserBinding);
   const page = await b.newPage();
-  const lookbackDays = config.lookbackDays ?? 30;
+  const lookbackDays = config.lookbackMonths ? config.lookbackMonths * 30 : 30;
 
   try {
     await page.setViewport({ width: 1280, height: 800 });
@@ -416,18 +416,36 @@ async function scrapeCreditCards(page: Page): Promise<Scraped> {
 
   const cardOverview = await page.evaluate(() => {
     const text = document.body.innerText;
+    const parseAmt = (s: string | undefined) => parseInt((s ?? "").replace(/[^\d]/g, ""), 10) || 0;
+
     const last4Match = text.match(/卡片末四碼[：:]\s*(\d{4})/);
     const cardNameMatch = text.match(/([^\n]+?(?:MasterCard|VISA|JCB|銀聯)[^\n]*)/);
-    const limitMatch = text.match(/永久信用額度\s*TWD\s*([\d,]+)/);
-    const availMatch = text.match(/剩餘可用額度[^\d]*([\d,]+)/);
-    const billMatch = text.match(/新臺幣應繳總金額[\s\S]{0,100}?(-?TWD\s*[\d,]+)/);
-    const parseAmt = (s: string | undefined) => parseInt((s ?? "").replace(/[^\d]/g, ""), 10) || 0;
+    const limitMatch = text.match(/永久信用額度\s*(?:TWD\s*)?([\d,]+)/);
+    const availMatch = text.match(/剩餘可用額度[\s\S]{0,20}?(?:TWD\s*)?([\d,]+)/);
+    const dueDateMatch = text.match(/繳款截止日[\s\S]{0,10}?(\d{4}[\/\-]\d{2}[\/\-]\d{2})/);
+
+    // Statement balance from most recent bill line (e.g. "2026年06月 臺幣帳單 ... -TWD 1,135")
+    const billLineMatch = text.match(/\d{4}年\d{2}月[\s\S]{0,60}?(-?TWD\s*[\d,]+)/);
+    const billRaw = billLineMatch?.[1]?.trim() ?? "";
+    const billIsNeg = billRaw.startsWith("-");
+    const statementBalance = billIsNeg ? -parseAmt(billRaw) : parseAmt(billRaw);
+
+    // 未繳餘額: "無需繳費" → 0, otherwise extract from 應繳/未繳 line
+    const noPaymentNeeded = text.includes("無需繳費");
+    const unpaidMatch = !noPaymentNeeded
+      ? text.match(/(?:應繳|未繳)(?:金額|餘額)?[\s\S]{0,20}?(?:TWD\s*)?([\d,]+)/)
+      : null;
+    const unpaidAmount = noPaymentNeeded ? 0 : parseAmt(unpaidMatch?.[1]);
+
     return {
       last4: last4Match?.[1] ?? "",
       cardName: last4Match ? `國泰信用卡 末四碼 ${last4Match[1]}` : (cardNameMatch?.[1]?.trim() ?? "國泰信用卡"),
       creditLimit: parseAmt(limitMatch?.[1]),
       availableCredit: parseAmt(availMatch?.[1]),
-      currentBillRaw: billMatch?.[1]?.trim() ?? ""
+      statementBalance,    // 帳單金額（負數 = 消費；正數 = 退刷回沖）
+      unpaidAmount,         // 未繳餘額（0 = 無需繳費）
+      paymentDueDate: dueDateMatch?.[1]?.replace(/\//g, "-") ?? null,
+      noPaymentNeeded
     };
   });
 
@@ -441,18 +459,19 @@ async function scrapeCreditCards(page: Page): Promise<Scraped> {
     accountName: cardOverview.cardName,
     accountType: "credit",
     currency: "TWD",
+    creditLimit: cardOverview.creditLimit || undefined,
     raw: cardOverview
   });
-
-  const billText = cardOverview.currentBillRaw;
-  const isNeg = billText.startsWith("-");
-  const billAmt = parseInt(billText.replace(/[^\d]/g, ""), 10) || 0;
-  const outstanding = isNeg ? -billAmt : billAmt;
 
   bankBalanceSnapshots.push({
     accountId: sourceId,
     sourceId: `${sourceId}:${asOfAt}`,
-    balance: -outstanding, // negative balance = money owed
+    // balance = unpaid amount (negative = money owed); 0 when no payment needed
+    balance: -cardOverview.unpaidAmount,
+    availableBalance: cardOverview.availableCredit || undefined,
+    statementBalance: cardOverview.statementBalance || undefined,
+    paymentDueDate: cardOverview.paymentDueDate ?? undefined,
+    noPaymentNeeded: cardOverview.noPaymentNeeded,
     currency: "TWD",
     asOfAt,
     raw: cardOverview

@@ -286,36 +286,49 @@ async function scrapeCreditCards(client: EsunHttpClient, lookbackMonths: number)
   ]);
   const asOfAt = new Date().toISOString();
 
-  const mainSourceId = "credit:esun:main";
+  const cards = getCreditCards(detail);
   const bankTransactions = await scrapeTransactions(client);
+  const accountIds = new Set<string>([
+    ...cards.map((card) => creditCardSourceId(card.cardNo)),
+    ...bankTransactions.map((transaction) => transaction.accountId)
+  ]);
+  accountIds.delete("");
 
-  // All transactions go to the shared main account (E.SUN pools credit limit across cards)
-  for (const txn of bankTransactions) {
-    txn.accountId = mainSourceId;
-  }
+  const mainSourceId = "credit:esun:main";
+  accountIds.add(mainSourceId);
 
-  const creditLimit = overview.trsam ?? undefined;
-  const availableCredit = overview.trsam != null && overview.useam != null
-    ? Math.max(0, overview.trsam - overview.useam)
-    : undefined;
+  // detail endpoint has the actual credit limit and available credit fields
+  // overview.trsam/useam appear to be statement amounts, not limit/available
+  const creditLimit = detail.creditLimit ? parseTwd(detail.creditLimit) : undefined;
+  const availableCredit = detail.availCreditAmt
+    ? parseTwd(detail.availCreditAmt)
+    : detail.availableAmt
+      ? parseTwd(detail.availableAmt)
+      : undefined;
   const paymentDueDate = parseEsunCompactDate(overview.paydt) ?? undefined;
   const currentBill = overview.bills?.[0];
   const statementBalance = currentBill?.tamt ?? overview.tamt ?? undefined;
   const noPaymentNeeded = statementBalance === 0;
 
   console.log(`[esun debug] creditLimit=${creditLimit} availableCredit=${availableCredit} statementBalance=${statementBalance} paymentDueDate=${paymentDueDate}`);
+  console.log(`[esun debug] detail={creditLimit:${detail.creditLimit},availCreditAmt:${detail.availCreditAmt},availableAmt:${detail.availableAmt},balance:${detail.balance}}`);
+  console.log(`[esun debug] overview={trsam:${overview.trsam},useam:${overview.useam},tamt:${overview.tamt}}`);
 
-  const bankAccounts: Scraped["bankAccounts"] = [{
-    sourceId: mainSourceId,
-    institutionName: "玉山銀行",
-    accountName: "玉山信用卡",
-    accountType: "credit",
-    currency: "TWD",
-    creditLimit,
-    raw: detail
-  }];
+  const cardBySourceId = new Map(cards.map((card) => [creditCardSourceId(card.cardNo), card]));
+  const bankAccounts: Scraped["bankAccounts"] = Array.from(accountIds).map((sourceId) => {
+    const card = cardBySourceId.get(sourceId);
+    return {
+      sourceId,
+      institutionName: "玉山銀行",
+      accountName: card?.cardNoDesc || (sourceId === mainSourceId ? "玉山信用卡" : `玉山信用卡 ${sourceId.slice(-4)}`),
+      accountType: "credit",
+      currency: "TWD",
+      creditLimit,
+      raw: card ?? detail
+    };
+  });
 
-  // Always create snapshot — even if balance is 0, we still want available credit/limit
+  // Always create snapshot — even if outstanding is 0, available credit still needs to show
   const outstanding = readOutstandingBalance(detail);
   const bankBalanceSnapshots: Scraped["bankBalanceSnapshots"] = [{
     accountId: mainSourceId,

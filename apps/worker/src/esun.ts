@@ -535,9 +535,10 @@ async function scrapeDepositAccounts(
   cutoffDate.setMonth(cutoffDate.getMonth() - lookbackMonths);
   const cutoffDateStr = cutoffDate.toISOString().slice(0, 10).replace(/-/g, "/");
   // Required: initialize server-side session state before findTxDetails calls
-  await client.postJson(ACCOUNT_TX_INIT_URL, {});
+  const txInit = await client.postJson<{ drActList?: unknown[] }>(ACCOUNT_TX_INIT_URL, {});
+  console.log(`[esun debug] fao01013 init: drActList=${txInit.drActList?.length ?? 0}`);
   const overview = await client.postJson<EsunAccountOverviewData>(ACCOUNT_OVERVIEW_URL, {});
-  console.log(`[esun debug] overview: twDetails=${overview.twDetails?.length ?? 0} frDetails=${overview.frDetails?.length ?? 0}`);
+  console.log(`[esun debug] overview: twDetails=${overview.twDetails?.length ?? 0} frDetails=${overview.frDetails?.length ?? 0} lookbackMonths=${lookbackMonths} cutoffDateStr=${cutoffDateStr}`);
   const asOfAt = new Date().toISOString();
 
   const bankAccounts: Scraped["bankAccounts"] = [];
@@ -635,21 +636,26 @@ async function fetchAccountTransactionPages(
     });
 
     let reachedCutoff = false;
+    let skippedCutoff = 0;
+    let skippedWatermark = 0;
     for (const month of data.txMasters ?? []) {
       for (const detail of month.details ?? []) {
         const dateStr = detail.txDate?.trim().replace(/-/g, "/") ?? "";
         if (dateStr && dateStr < cutoffDateStr) {
           reachedCutoff = true;
+          skippedCutoff++;
           continue;
         }
         if (watermark && txDateTimeKey(detail) <= watermark) {
           reachedCutoff = true;
+          skippedWatermark++;
           continue;
         }
         rows.push(detail);
       }
     }
-    console.log(`[esun debug] ${account} page ${page}: txMasters=${data.txMasters?.length ?? 0} searchKxy=${data.searchKxy ?? "null"} reachedCutoff=${reachedCutoff}`);
+    const months = (data.txMasters ?? []).map((m) => `${m.year}/${m.month}(${m.details?.length ?? 0})`).join(",");
+    console.log(`[esun debug] ${account} page ${page}: months=[${months}] added=${rows.length} skippedCutoff=${skippedCutoff} skippedWatermark=${skippedWatermark} searchKxy=${data.searchKxy ?? "null"} reachedCutoff=${reachedCutoff}`);
 
     if (reachedCutoff || !data.searchKxy) break;
     searchKxy = data.searchKxy;

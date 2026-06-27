@@ -1234,13 +1234,6 @@ async function syncEsun(env: Env, trigger: SyncTrigger): Promise<SyncOutcome> {
   const stored = await decryptJson<unknown>(settings.encrypted_config, configEncryptionKey(env));
   const config = parseEsunConfig(stored);
 
-  if (
-    trigger === "scheduled" &&
-    (!config.sessionCookies || !config.sessionExpiresAt || new Date(config.sessionExpiresAt) <= new Date())
-  ) {
-    throw new NeedsUserActionError("E.SUN scheduled sync requires a valid stored session. Run manual sync to refresh login.");
-  }
-
   console.log(`[sync] ${connectorId}/${scope}: starting trigger=${trigger} (cursor=${settings.sync_cursor ?? "none"})`);
   const result = await createEsunConnector(env.BROWSER).sync(config, settings.sync_cursor ?? undefined);
 

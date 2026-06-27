@@ -15,7 +15,6 @@ import {
   type BankAccount,
   type BankBalanceSnapshot,
   type BankTransaction,
-  type Connector,
   type ConnectorId,
   type CreditCardBill,
   type InvestmentPosition,
@@ -26,7 +25,6 @@ import {
 } from "@taiwan-fin-hub/core";
 import {
   getConnectorSettings,
-  updateConnectorCursor,
   updateConnectorPublicConfig,
   upsertConnectorSettings
 } from "@taiwan-fin-hub/db";
@@ -50,6 +48,55 @@ interface Env {
 type Variables = {
   connectorId: ConnectorId;
 };
+
+type SyncTrigger = "manual" | "scheduled";
+type SyncScope = string;
+type SyncStatus = "success" | "failed" | "needs_user_action";
+
+const SYNC_SCOPE_ALL = "all";
+const TDCC_SCOPE_INVESTMENTS = "investments";
+const TDCC_SCOPE_BANK = "bank";
+const TDCC_SCOPE_TRADES = "trades";
+
+type SyncJobRow = {
+  id: string;
+  connector_id: ConnectorId;
+  scope: SyncScope;
+  enabled: number;
+  interval_minutes: number;
+  next_run_at: string;
+  locked_until: string | null;
+  locked_by: string | null;
+  lock_trigger: SyncTrigger | null;
+  lock_scope: SyncScope | null;
+  last_run_at: string | null;
+  last_success_at: string | null;
+  last_status: SyncStatus | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type SyncOutcome = {
+  success: true;
+  connectorId: ConnectorId;
+  scope: SyncScope;
+  records: number;
+  cursorUpdated: boolean;
+  detailRecords?: number;
+};
+
+class SyncAlreadyRunningError extends Error {
+  constructor(readonly connectorId: ConnectorId) {
+    super(`${connectorId} sync is already running.`);
+  }
+}
+
+class NeedsUserActionError extends Error {
+  constructor(message: string) {
+    super(message);
+  }
+}
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 const api = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -76,6 +123,10 @@ const einvoiceSyncBodySchema = z.object({
 const bankHistoryRebuildBodySchema = z.object({
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+});
+
+const syncJobUpdateSchema = z.object({
+  enabled: z.boolean()
 });
 
 function jsonError(code: string, message: string, status = 400) {
@@ -919,27 +970,161 @@ api.put("/connectors/:connectorId/settings", async (c) => {
   });
 });
 
-api.post("/connectors/einvoice/sync", async (c) => {
-  const settings = await getConnectorSettings(c.env.DB, "einvoice");
-  if (!settings) {
-    return c.json(
-      {
-        success: false,
-        error: {
-          code: "CONNECTOR_CONFIG_MISSING",
-          message: "Connector settings are required before sync."
-        }
-      },
-      400
-    );
+api.get("/sync-jobs", async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT
+       id,
+       connector_id AS connectorId,
+       scope,
+       enabled,
+       interval_minutes AS intervalMinutes,
+       next_run_at AS nextRunAt,
+       locked_until AS lockedUntil,
+       locked_by AS lockedBy,
+       lock_trigger AS lockTrigger,
+       lock_scope AS lockScope,
+       last_run_at AS lastRunAt,
+       last_success_at AS lastSuccessAt,
+       last_status AS lastStatus,
+       last_error AS lastError,
+       updated_at AS updatedAt
+     FROM sync_jobs
+     ORDER BY connector_id ASC, scope ASC`
+  ).all<{
+    id: string;
+    connectorId: ConnectorId;
+    scope: string;
+    enabled: number;
+    intervalMinutes: number;
+    nextRunAt: string;
+    lockedUntil: string | null;
+    lockedBy: string | null;
+    lockTrigger: SyncTrigger | null;
+    lockScope: string | null;
+    lastRunAt: string | null;
+    lastSuccessAt: string | null;
+    lastStatus: SyncStatus | null;
+    lastError: string | null;
+    updatedAt: string;
+  }>();
+
+  return c.json(rows.results.map((row) => ({
+    ...row,
+    enabled: Boolean(row.enabled),
+    running: Boolean(row.lockedUntil && new Date(row.lockedUntil) > new Date())
+  })));
+});
+
+api.patch("/sync-jobs/:connectorId/:scope", async (c) => {
+  const connectorId = c.req.param("connectorId");
+  if (!isConnectorId(connectorId)) {
+    return jsonError("CONNECTOR_NOT_FOUND", "Connector id is not supported.", 404);
   }
 
-  const encryptionKey = configEncryptionKey(c.env);
-  const config = await decryptJson<unknown>(settings.encrypted_config, encryptionKey);
+  const scope = c.req.param("scope");
+  const body = syncJobUpdateSchema.safeParse(await c.req.json().catch(() => null));
+  if (!body.success) {
+    return jsonError("INVALID_REQUEST_BODY", "Request body must include an enabled boolean.");
+  }
+
+  const now = new Date().toISOString();
+  const result = await c.env.DB.prepare(
+    `UPDATE sync_jobs
+     SET enabled = ?,
+         updated_at = ?
+     WHERE connector_id = ?
+       AND scope = ?`
+  ).bind(body.data.enabled ? 1 : 0, now, connectorId, scope).run();
+
+  if (result.meta.changes !== 1) {
+    return jsonError("SYNC_JOB_NOT_FOUND", "Sync job is not configured.", 404);
+  }
+
+  return c.json({
+    success: true,
+    connectorId,
+    scope,
+    enabled: body.data.enabled
+  });
+});
+
+api.post("/connectors/einvoice/sync", async (c) => {
   const overrides = einvoiceSyncBodySchema.parse(await c.req.json().catch(() => ({})));
+  return syncRouteResponse(c, withManualSyncLock(c.env, "einvoice", SYNC_SCOPE_ALL, () =>
+    syncEinvoice(c.env, "manual", overrides)
+  ));
+});
+
+api.post("/connectors/tdcc/sync", async (c) => {
+  const overrides = await tdccSyncBody(c);
+  return syncRouteResponse(c, withManualSyncLock(c.env, "tdcc", SYNC_SCOPE_ALL, () =>
+    syncTdcc(c.env, "manual", overrides, [
+      TDCC_SCOPE_INVESTMENTS,
+      TDCC_SCOPE_BANK,
+      TDCC_SCOPE_TRADES
+    ])
+  ));
+});
+api.post("/connectors/tdcc/sync/investments", async (c) => {
+  const overrides = await tdccSyncBody(c);
+  return syncRouteResponse(c, withManualSyncLock(c.env, "tdcc", TDCC_SCOPE_INVESTMENTS, () =>
+    syncTdcc(c.env, "manual", overrides, [TDCC_SCOPE_INVESTMENTS])
+  ));
+});
+api.post("/connectors/tdcc/sync/bank", async (c) => {
+  const overrides = await tdccSyncBody(c);
+  return syncRouteResponse(c, withManualSyncLock(c.env, "tdcc", TDCC_SCOPE_BANK, () =>
+    syncTdcc(c.env, "manual", overrides, [TDCC_SCOPE_BANK])
+  ));
+});
+api.post("/connectors/tdcc/sync/trades", async (c) => {
+  const overrides = await tdccSyncBody(c);
+  return syncRouteResponse(c, withManualSyncLock(c.env, "tdcc", TDCC_SCOPE_TRADES, () =>
+    syncTdcc(c.env, "manual", overrides, [TDCC_SCOPE_TRADES])
+  ));
+});
+
+api.post("/connectors/esun/sync", async (c) => {
+  return syncRouteResponse(c, withManualSyncLock(c.env, "esun", SYNC_SCOPE_ALL, () => syncEsun(c.env, "manual")));
+});
+
+api.post("/connectors/cathaybk/sync", async (c) => {
+  return syncRouteResponse(c, withManualSyncLock(c.env, "cathaybk", SYNC_SCOPE_ALL, () => syncCathaybk(c.env, "manual")));
+});
+
+async function tdccSyncBody(c: Context<{ Bindings: Env; Variables: Variables }>) {
+  return tdccSyncBodySchema.parse(await c.req.json().catch(() => ({})));
+}
+
+async function syncRouteResponse(
+  c: Context<{ Bindings: Env; Variables: Variables }>,
+  result: Promise<SyncOutcome>
+) {
+  try {
+    return c.json(await result);
+  } catch (error) {
+    if (error instanceof SyncAlreadyRunningError) {
+      return jsonError("SYNC_ALREADY_RUNNING", error.message, 409);
+    }
+    if (error instanceof NeedsUserActionError) {
+      return jsonError("USER_ACTION_REQUIRED", error.message, 400);
+    }
+    throw error;
+  }
+}
+
+async function syncEinvoice(
+  env: Env,
+  trigger: SyncTrigger,
+  overrides: z.infer<typeof einvoiceSyncBodySchema> = {}
+): Promise<SyncOutcome> {
+  const connectorId = "einvoice";
+  const scope = "all";
+  const settings = await requireConnectorSettings(env.DB, connectorId);
+  const config = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
   const parsedConfig = parseInvoiceConfig({ ...(config as Record<string, unknown>), ...overrides });
   const originalInvoiceConfig = invoiceConfigSnapshot(config as { fetchDetails?: boolean; userToken?: string; mobileBarcode?: string });
-  console.log(`[sync] einvoice: starting (cursor=${settings.sync_cursor ?? "none"})`);
+  console.log(`[sync] ${connectorId}/${scope}: starting trigger=${trigger} (cursor=${settings.sync_cursor ?? "none"})`);
   const result = await einvoiceConnector.sync(parsedConfig, settings.sync_cursor ?? undefined);
   const invoiceLineItems = result.invoiceLineItems ?? [];
   const detailErrorCount =
@@ -947,14 +1132,14 @@ api.post("/connectors/einvoice/sync", async (c) => {
       ? result.detailErrorCount
       : 0;
   console.log(
-    `[sync] einvoice: fetched ${result.records.length} invoices, ${invoiceLineItems.length} detail rows` +
+    `[sync] ${connectorId}/${scope}: fetched ${result.records.length} invoices, ${invoiceLineItems.length} detail rows` +
       (detailErrorCount > 0 ? `, ${detailErrorCount} detail errors` : "")
   );
   const now = new Date().toISOString();
 
   const statements = result.records.map((invoice) => {
-    const id = stableId("einvoice", invoice.sourceId);
-    return c.env.DB.prepare(
+    const id = stableId(connectorId, invoice.sourceId);
+    return env.DB.prepare(
       `INSERT INTO invoices (
         id,
         connector_id,
@@ -976,7 +1161,7 @@ api.post("/connectors/einvoice/sync", async (c) => {
         updated_at = excluded.updated_at`
     ).bind(
       id,
-      "einvoice",
+      connectorId,
       invoice.sourceId,
       invoice.invoiceNumber ?? null,
       invoice.invoiceDate,
@@ -988,218 +1173,207 @@ api.post("/connectors/einvoice/sync", async (c) => {
     );
   });
   statements.push(
-    ...invoiceLineItems.map((item) => invoiceLineItemStatement(c.env.DB, "einvoice", item, now))
+    ...invoiceLineItems.map((item) => invoiceLineItemStatement(env.DB, connectorId, item, now))
   );
 
   if (result.cursor) {
-    statements.push(cursorStatement(c.env.DB, "einvoice", result.cursor, now));
+    statements.push(cursorStatement(env.DB, connectorId, result.cursor, now));
   }
 
   if (invoiceConfigChanged(originalInvoiceConfig, parsedConfig)) {
     statements.push(
-      c.env.DB.prepare(
+      env.DB.prepare(
         `UPDATE connector_settings
         SET encrypted_config = ?, updated_at = ?
         WHERE connector_id = ?`
-      ).bind(await encryptJson(parsedConfig, encryptionKey), now, "einvoice")
+      ).bind(await encryptJson(parsedConfig, env.CONFIG_ENCRYPTION_KEY), now, connectorId)
     );
   }
 
   if (statements.length > 0) {
-    await c.env.DB.batch(statements);
+    await env.DB.batch(statements);
   }
 
-  return c.json({
+  return {
     success: true,
+    connectorId,
+    scope,
     records: result.records.length,
     detailRecords: invoiceLineItems.length,
     cursorUpdated: Boolean(result.cursor && result.cursor !== settings.sync_cursor)
-  });
-});
+  };
+}
 
-api.post("/connectors/tdcc/sync", async (c) =>
-  syncTdccRecords(c, "tdcc", tdccConnector, parseTdccConfig, {
-    writeInvestments: true,
-    writeBank: true
-  })
-);
-api.post("/connectors/tdcc/sync/investments", async (c) =>
-  syncTdccRecords(c, "tdcc", tdccConnector, parseTdccConfig, {
-    writeInvestments: true,
-    writeBank: false
-  })
-);
-api.post("/connectors/tdcc/sync/bank", async (c) =>
-  syncTdccRecords(c, "tdcc", tdccConnector, parseTdccConfig, {
-    writeInvestments: false,
-    writeBank: true
-  })
-);
-api.post("/connectors/tdcc/sync/trades", async (c) => syncTdccTradeRecords(c));
+async function syncEsun(env: Env, trigger: SyncTrigger): Promise<SyncOutcome> {
+  const connectorId = "esun";
+  const scope = "all";
+  const settings = await requireConnectorSettings(env.DB, connectorId);
+  const stored = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
+  const config = parseEsunConfig(stored);
 
-api.post("/connectors/esun/sync", async (c) => {
-  const settings = await getConnectorSettings(c.env.DB, "esun");
-  if (!settings) {
-    return c.json(
-      { success: false, error: { code: "CONNECTOR_CONFIG_MISSING", message: "Connector settings are required before sync." } },
-      400
-    );
+  if (
+    trigger === "scheduled" &&
+    (!config.sessionCookies || !config.sessionExpiresAt || new Date(config.sessionExpiresAt) <= new Date())
+  ) {
+    throw new NeedsUserActionError("E.SUN scheduled sync requires a valid stored session. Run manual sync to refresh login.");
   }
 
-  const encryptionKey = configEncryptionKey(c.env);
-  const stored = await decryptJson<unknown>(settings.encrypted_config, encryptionKey);
-  const publicStored = settings.public_config ? JSON.parse(settings.public_config) : {};
-  const config = parseEsunConfig({ ...(stored as object), ...publicStored });
-
-  console.log(`[sync] esun: starting (cursor=${settings.sync_cursor ?? "none"})`);
-  const result = await createEsunConnector(c.env.BROWSER).sync(config, settings.sync_cursor ?? undefined);
+  console.log(`[sync] ${connectorId}/${scope}: starting trigger=${trigger} (cursor=${settings.sync_cursor ?? "none"})`);
+  const result = await createEsunConnector(env.BROWSER).sync(config, settings.sync_cursor ?? undefined);
 
   const bankAccounts = result.bankAccounts ?? [];
   const bankBalanceSnapshots = result.bankBalanceSnapshots ?? [];
   const bankTransactions = result.bankTransactions ?? [];
   const creditCardBills = result.creditCardBills ?? [];
-  console.log(`[sync] esun: accounts=${bankAccounts.length} snapshots=${bankBalanceSnapshots.length} transactions=${bankTransactions.length} bills=${creditCardBills.length}`);
+  console.log(`[sync] ${connectorId}/${scope}: accounts=${bankAccounts.length} snapshots=${bankBalanceSnapshots.length} transactions=${bankTransactions.length} bills=${creditCardBills.length}`);
 
   const now = new Date().toISOString();
   const statements: D1PreparedStatement[] = [
-    ...bankAccounts.map((a) => bankAccountStatement(c.env.DB, "esun", a, now)),
-    ...bankBalanceSnapshots.map((s) => bankBalanceSnapshotStatement(c.env.DB, "esun", s, now)),
-    ...bankTransactions.map((t) => bankTransactionStatement(c.env.DB, "esun", t, now)),
-    ...creditCardBills.map((b) => creditCardBillStatement(c.env.DB, "esun", b, now)),
-    ...(bankAccounts.length > 0 ? [linkCanonicalBankAccountsStatement(c.env.DB)] : [])
+    ...bankAccounts.map((a) => bankAccountStatement(env.DB, connectorId, a, now)),
+    ...bankBalanceSnapshots.map((s) => bankBalanceSnapshotStatement(env.DB, connectorId, s, now)),
+    ...bankTransactions.map((t) => bankTransactionStatement(env.DB, connectorId, t, now)),
+    ...creditCardBills.map((b) => creditCardBillStatement(env.DB, connectorId, b, now)),
+    ...(bankAccounts.length > 0 ? [linkCanonicalBankAccountsStatement(env.DB)] : [])
   ];
 
   if (result.cursor) {
-    // Store fresh session cookies back into encrypted config so next sync can reuse the session
     const updatedConfig = { ...config, ...JSON.parse(result.cursor) };
     statements.push(
-      c.env.DB.prepare(`UPDATE connector_settings SET encrypted_config = ?, sync_cursor = ?, updated_at = ? WHERE connector_id = ?`)
-        .bind(await encryptJson(updatedConfig, encryptionKey), result.cursor, now, "esun")
+      env.DB.prepare(`UPDATE connector_settings SET encrypted_config = ?, sync_cursor = ?, updated_at = ? WHERE connector_id = ?`)
+        .bind(await encryptJson(updatedConfig, env.CONFIG_ENCRYPTION_KEY), result.cursor, now, connectorId)
     );
   }
 
   if (statements.length > 0) {
-    await c.env.DB.batch(statements);
+    await env.DB.batch(statements);
   }
 
   if (bankBalanceSnapshots.length > 0) {
-    await rebuildBankDepositHistory(c.env.DB, [dateFromIso(now)]);
+    await rebuildBankDepositHistory(env.DB, [dateFromIso(now)]);
   }
 
-  return c.json({
+  return {
     success: true,
+    connectorId,
+    scope,
     records: bankAccounts.length + bankBalanceSnapshots.length + bankTransactions.length,
     cursorUpdated: Boolean(result.cursor && result.cursor !== settings.sync_cursor)
-  });
-});
+  };
+}
 
-api.post("/connectors/cathaybk/sync", async (c) => {
-  const settings = await getConnectorSettings(c.env.DB, "cathaybk");
-  if (!settings) {
-    return c.json(
-      { success: false, error: { code: "CONNECTOR_CONFIG_MISSING", message: "Connector settings are required before sync." } },
-      400
-    );
-  }
+async function syncCathaybk(env: Env, trigger: SyncTrigger): Promise<SyncOutcome> {
+  const connectorId = "cathaybk";
+  const scope = "all";
+  const settings = await requireConnectorSettings(env.DB, connectorId);
+  const stored = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
+  const publicStored = settings.public_config ? JSON.parse(settings.public_config) : {};
+  const config = parseCathaybkConfig({ ...(stored as object), ...publicStored });
 
-  const encryptionKey = configEncryptionKey(c.env);
-  const stored = await decryptJson<unknown>(settings.encrypted_config, encryptionKey);
-  const publicStoredCathaybk = settings.public_config ? JSON.parse(settings.public_config) : {};
-  const config = parseCathaybkConfig({ ...(stored as object), ...publicStoredCathaybk });
-
-  console.log(`[sync] cathaybk: starting (cursor=${settings.sync_cursor ?? "none"})`);
-  const result = await createCathaybkConnector(c.env.BROWSER).sync(config, settings.sync_cursor ?? undefined);
+  console.log(`[sync] ${connectorId}/${scope}: starting trigger=${trigger} (cursor=${settings.sync_cursor ?? "none"})`);
+  const result = await createCathaybkConnector(env.BROWSER).sync(config, settings.sync_cursor ?? undefined);
 
   const bankAccounts = result.bankAccounts ?? [];
   const bankBalanceSnapshots = result.bankBalanceSnapshots ?? [];
   const bankTransactions = result.bankTransactions ?? [];
   const creditCardBills = result.creditCardBills ?? [];
-  console.log(`[sync] cathaybk: accounts=${bankAccounts.length} snapshots=${bankBalanceSnapshots.length} transactions=${bankTransactions.length} bills=${creditCardBills.length}`);
+  console.log(`[sync] ${connectorId}/${scope}: accounts=${bankAccounts.length} snapshots=${bankBalanceSnapshots.length} transactions=${bankTransactions.length} bills=${creditCardBills.length}`);
 
   const now = new Date().toISOString();
   const statements: D1PreparedStatement[] = [
-    ...bankAccounts.map((a) => bankAccountStatement(c.env.DB, "cathaybk", a, now)),
-    ...bankBalanceSnapshots.map((s) => bankBalanceSnapshotStatement(c.env.DB, "cathaybk", s, now)),
-    ...bankTransactions.map((t) => bankTransactionStatement(c.env.DB, "cathaybk", t, now)),
-    ...creditCardBills.map((b) => creditCardBillStatement(c.env.DB, "cathaybk", b, now)),
-    ...(bankAccounts.length > 0 ? [linkCanonicalBankAccountsStatement(c.env.DB)] : [])
+    ...bankAccounts.map((a) => bankAccountStatement(env.DB, connectorId, a, now)),
+    ...bankBalanceSnapshots.map((s) => bankBalanceSnapshotStatement(env.DB, connectorId, s, now)),
+    ...bankTransactions.map((t) => bankTransactionStatement(env.DB, connectorId, t, now)),
+    ...creditCardBills.map((b) => creditCardBillStatement(env.DB, connectorId, b, now)),
+    ...(bankAccounts.length > 0 ? [linkCanonicalBankAccountsStatement(env.DB)] : [])
   ];
 
   if (result.cursor) {
     const cursorState = JSON.parse(result.cursor) as Record<string, unknown>;
     const updatedConfig = { ...config, ...cursorState };
     statements.push(
-      c.env.DB.prepare(`UPDATE connector_settings SET encrypted_config = ?, sync_cursor = ?, updated_at = ? WHERE connector_id = ?`)
-        .bind(await encryptJson(updatedConfig, encryptionKey), result.cursor, now, "cathaybk")
+      env.DB.prepare(`UPDATE connector_settings SET encrypted_config = ?, sync_cursor = ?, updated_at = ? WHERE connector_id = ?`)
+        .bind(await encryptJson(updatedConfig, env.CONFIG_ENCRYPTION_KEY), result.cursor, now, connectorId)
     );
   }
 
   if (statements.length > 0) {
-    await c.env.DB.batch(statements);
+    await env.DB.batch(statements);
   }
 
   if (bankBalanceSnapshots.length > 0) {
-    await rebuildBankDepositHistory(c.env.DB, [dateFromIso(now)]);
+    await rebuildBankDepositHistory(env.DB, [dateFromIso(now)]);
   }
 
-  return c.json({
+  return {
     success: true,
+    connectorId,
+    scope,
     records: bankAccounts.length + bankBalanceSnapshots.length + bankTransactions.length,
     cursorUpdated: Boolean(result.cursor && result.cursor !== settings.sync_cursor)
-  });
-});
+  };
+}
 
-async function syncTdccRecords<TConfig>(
-  c: Context<{ Bindings: Env; Variables: Variables }>,
-  connectorId: "tdcc",
-  connector: Connector<TConfig, Omit<InvestmentPosition, "id" | "connectorId">>,
-  parseConfig: (config: unknown) => TConfig,
+async function syncTdcc(
+  env: Env,
+  trigger: SyncTrigger,
+  overrides: z.infer<typeof tdccSyncBodySchema>,
+  scopes: string[]
+): Promise<SyncOutcome> {
+  const selected = new Set(scopes.includes(SYNC_SCOPE_ALL)
+    ? [TDCC_SCOPE_INVESTMENTS, TDCC_SCOPE_BANK, TDCC_SCOPE_TRADES]
+    : scopes);
+  const scope = tdccOutcomeScope(selected);
+  let records = 0;
+  let cursorUpdated = false;
+
+  if (selected.has(TDCC_SCOPE_INVESTMENTS) || selected.has(TDCC_SCOPE_BANK)) {
+    const result = await syncTdccPositionsAndBank(env, trigger, overrides, {
+      writeInvestments: selected.has(TDCC_SCOPE_INVESTMENTS),
+      writeBank: selected.has(TDCC_SCOPE_BANK),
+      scope
+    });
+    records += result.records;
+    cursorUpdated = cursorUpdated || result.cursorUpdated;
+  }
+
+  if (selected.has(TDCC_SCOPE_TRADES)) {
+    const result = await syncTdccTrades(env, trigger, overrides, scope);
+    records += result.records;
+    cursorUpdated = cursorUpdated || result.cursorUpdated;
+  }
+
+  return {
+    success: true,
+    connectorId: "tdcc",
+    scope,
+    records,
+    cursorUpdated
+  };
+}
+
+async function syncTdccPositionsAndBank(
+  env: Env,
+  trigger: SyncTrigger,
+  overrides: z.infer<typeof tdccSyncBodySchema>,
   options: {
     writeInvestments: boolean;
     writeBank: boolean;
+    scope: SyncScope;
   }
-) {
-  const settings = await getConnectorSettings(c.env.DB, connectorId);
-  if (!settings) {
-    return c.json(
-      {
-        success: false,
-        error: {
-          code: "CONNECTOR_CONFIG_MISSING",
-          message: "Connector settings are required before sync."
-        }
-      },
-      400
-    );
-  }
-
-  const encryptionKey = configEncryptionKey(c.env);
-  const config = await decryptJson<unknown>(settings.encrypted_config, encryptionKey);
-  // The web UI never gets stored secrets back, so submitting an OTP only sends
-  // the code itself — merge it onto the stored config instead of requiring a
-  // full credentials resend.
-  const overrides = tdccSyncBodySchema.parse(await c.req.json().catch(() => ({})));
+): Promise<{ records: number; cursorUpdated: boolean }> {
+  const connectorId = "tdcc";
+  const settings = await requireConnectorSettings(env.DB, connectorId);
+  const config = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
   const mergedConfig = { ...(config as Record<string, unknown>), ...overrides };
-  const parsedConfig = parseConfig(mergedConfig);
-  const syncScope =
-    options.writeInvestments && options.writeBank ? "all" : options.writeInvestments ? "investments" : "bank";
-  console.log(`[sync] ${connectorId}/${syncScope}: starting (cursor=${settings.sync_cursor ?? "none"})`);
+  const parsedConfig = parseTdccConfig(mergedConfig);
+  const syncScope = options.scope;
+  console.log(`[sync] ${connectorId}/${syncScope}: starting trigger=${trigger} (cursor=${settings.sync_cursor ?? "none"})`);
 
-  let result: Awaited<ReturnType<typeof connector.sync>>;
+  let result: Awaited<ReturnType<typeof tdccConnector.sync>>;
   try {
-    result = await connector.sync(parsedConfig, settings.sync_cursor ?? undefined);
+    result = await tdccConnector.sync(parsedConfig, settings.sync_cursor ?? undefined);
   } catch (error) {
-    if (error instanceof TdccOtpExpiredError) {
-      const { otp, ...configWithoutOtp } = mergedConfig;
-      await upsertConnectorSettings(c.env.DB, {
-        id: settings.id,
-        connectorId,
-        encryptedConfig: await encryptJson(configWithoutOtp, encryptionKey),
-        publicConfig: settings.public_config ?? null,
-        now: new Date().toISOString()
-      });
-      console.log(`[sync] ${connectorId}/${syncScope}: cleared expired otp from config`);
-    }
+    await handleTdccSyncError(env, settings.id, connectorId, mergedConfig, syncScope, trigger, error);
     throw error;
   }
 
@@ -1212,102 +1386,356 @@ async function syncTdccRecords<TConfig>(
   const netWorthHistory = result.netWorthHistory ?? [];
   console.log(`[sync] ${connectorId}/${syncScope}: bank accounts=${bankAccounts.length} snapshots=${bankBalanceSnapshots.length} transactions=${bankTransactions.length} history=${netWorthHistory.length}`);
   const statements: D1PreparedStatement[] = [
-    ...(options.writeBank ? bankAccounts.map((account) => bankAccountStatement(c.env.DB, connectorId, account, now)) : []),
+    ...(options.writeBank ? bankAccounts.map((account) => bankAccountStatement(env.DB, connectorId, account, now)) : []),
     ...(options.writeBank
-      ? bankBalanceSnapshots.map((snapshot) => bankBalanceSnapshotStatement(c.env.DB, connectorId, snapshot, now))
+      ? bankBalanceSnapshots.map((snapshot) => bankBalanceSnapshotStatement(env.DB, connectorId, snapshot, now))
       : []),
     ...(options.writeBank
-      ? bankTransactions.map((transaction) => bankTransactionStatement(c.env.DB, connectorId, transaction, now))
+      ? bankTransactions.map((transaction) => bankTransactionStatement(env.DB, connectorId, transaction, now))
       : []),
     ...(options.writeInvestments
-      ? result.records.map((position) => investmentPositionStatement(c.env.DB, connectorId, position, now))
+      ? result.records.map((position) => investmentPositionStatement(env.DB, connectorId, position, now))
       : []),
-    ...netWorthHistory.map((point) => netWorthHistoryStatement(c.env.DB, connectorId, point, now)),
-    ...(options.writeBank && bankAccounts.length > 0 ? [linkCanonicalBankAccountsStatement(c.env.DB)] : [])
+    ...netWorthHistory.map((point) => netWorthHistoryStatement(env.DB, connectorId, point, now)),
+    ...(options.writeBank && bankAccounts.length > 0 ? [linkCanonicalBankAccountsStatement(env.DB)] : [])
   ];
 
   if (result.cursor) {
-    statements.push(cursorStatement(c.env.DB, connectorId, result.cursor, now));
+    statements.push(cursorStatement(env.DB, connectorId, result.cursor, now));
   }
 
   if (statements.length > 0) {
-    await c.env.DB.batch(statements);
+    await env.DB.batch(statements);
   }
 
   if (options.writeBank && bankBalanceSnapshots.length > 0) {
-    await rebuildBankDepositHistory(c.env.DB, [dateFromIso(now)]);
+    await rebuildBankDepositHistory(env.DB, [dateFromIso(now)]);
   }
 
-  return c.json({
-    success: true,
+  return {
     records:
       (options.writeInvestments ? result.records.length : 0) +
       (options.writeBank ? bankAccounts.length + bankBalanceSnapshots.length + bankTransactions.length : 0),
     cursorUpdated: Boolean(result.cursor && result.cursor !== settings.sync_cursor)
-  });
+  };
 }
 
-async function syncTdccTradeRecords(c: Context<{ Bindings: Env; Variables: Variables }>) {
+async function syncTdccTrades(
+  env: Env,
+  trigger: SyncTrigger,
+  overrides: z.infer<typeof tdccSyncBodySchema>,
+  scope: SyncScope
+): Promise<{ records: number; cursorUpdated: boolean }> {
   const connectorId = "tdcc";
-  const settings = await getConnectorSettings(c.env.DB, connectorId);
-  if (!settings) {
-    return c.json(
-      {
-        success: false,
-        error: {
-          code: "CONNECTOR_CONFIG_MISSING",
-          message: "Connector settings are required before sync."
-        }
-      },
-      400
-    );
-  }
-
-  const encryptionKey = configEncryptionKey(c.env);
-  const config = await decryptJson<unknown>(settings.encrypted_config, encryptionKey);
-  const overrides = tdccSyncBodySchema.parse(await c.req.json().catch(() => ({})));
+  const settings = await requireConnectorSettings(env.DB, connectorId);
+  const config = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
   const mergedConfig = { ...(config as Record<string, unknown>), ...overrides };
   const parsedConfig = parseTdccConfig(mergedConfig);
-  console.log(`[sync] tdcc/trades: starting (cursor=${settings.sync_cursor ?? "none"})`);
+  console.log(`[sync] ${connectorId}/${scope}: starting trigger=${trigger} (cursor=${settings.sync_cursor ?? "none"})`);
 
   let result: Awaited<ReturnType<typeof syncTdccTradeHistory>>;
   try {
     result = await syncTdccTradeHistory(parsedConfig, settings.sync_cursor ?? undefined);
   } catch (error) {
-    if (error instanceof TdccOtpExpiredError) {
-      const { otp, ...configWithoutOtp } = mergedConfig;
-      await upsertConnectorSettings(c.env.DB, {
-        id: settings.id,
-        connectorId,
-        encryptedConfig: await encryptJson(configWithoutOtp, encryptionKey),
-        publicConfig: settings.public_config ?? null,
-        now: new Date().toISOString()
-      });
-      console.log("[sync] tdcc/trades: cleared expired otp from config");
-    }
+    await handleTdccSyncError(env, settings.id, connectorId, mergedConfig, scope, trigger, error);
     throw error;
   }
 
   const now = new Date().toISOString();
   const investmentTransactions = result.investmentTransactions ?? [];
-  console.log(`[sync] tdcc/trades: fetched ${investmentTransactions.length} investment transactions`);
+  console.log(`[sync] ${connectorId}/${scope}: fetched ${investmentTransactions.length} investment transactions`);
   const statements: D1PreparedStatement[] = [
-    ...investmentTransactions.map((transaction) => investmentTransactionStatement(c.env.DB, connectorId, transaction, now))
+    ...investmentTransactions.map((transaction) => investmentTransactionStatement(env.DB, connectorId, transaction, now))
   ];
 
   if (result.cursor) {
-    statements.push(cursorStatement(c.env.DB, connectorId, result.cursor, now));
+    statements.push(cursorStatement(env.DB, connectorId, result.cursor, now));
   }
 
   if (statements.length > 0) {
-    await c.env.DB.batch(statements);
+    await env.DB.batch(statements);
   }
 
-  return c.json({
-    success: true,
+  return {
     records: investmentTransactions.length,
     cursorUpdated: Boolean(result.cursor && result.cursor !== settings.sync_cursor)
+  };
+}
+
+function tdccOutcomeScope(scopes: Set<string>): SyncScope {
+  const allScopes = [TDCC_SCOPE_INVESTMENTS, TDCC_SCOPE_BANK, TDCC_SCOPE_TRADES];
+  if (allScopes.every((scope) => scopes.has(scope))) return SYNC_SCOPE_ALL;
+  return allScopes.filter((scope) => scopes.has(scope)).join("+") || SYNC_SCOPE_ALL;
+}
+
+async function requireConnectorSettings(env: Env["DB"], connectorId: ConnectorId) {
+  const settings = await getConnectorSettings(env, connectorId);
+  if (!settings) {
+    throw new NeedsUserActionError("Connector settings are required before sync.");
+  }
+  return settings;
+}
+
+async function handleTdccSyncError(
+  env: Env,
+  settingsId: string,
+  connectorId: "tdcc",
+  mergedConfig: Record<string, unknown>,
+  scope: SyncScope,
+  trigger: SyncTrigger,
+  error: unknown
+): Promise<never> {
+  if (error instanceof TdccOtpExpiredError) {
+    const { otp, ...configWithoutOtp } = mergedConfig;
+    await upsertConnectorSettings(env.DB, {
+      id: settingsId,
+      connectorId,
+      encryptedConfig: await encryptJson(configWithoutOtp, env.CONFIG_ENCRYPTION_KEY),
+      now: new Date().toISOString()
+    });
+    console.log(`[sync] ${connectorId}/${scope}: cleared expired otp from config`);
+  }
+
+  if (trigger === "scheduled" && isUserActionError(error)) {
+    throw new NeedsUserActionError(error instanceof Error ? error.message : "Sync requires user action.");
+  }
+
+  throw error;
+}
+
+async function withManualSyncLock(
+  env: Env,
+  connectorId: ConnectorId,
+  scope: SyncScope,
+  task: () => Promise<SyncOutcome>
+) {
+  const runId = crypto.randomUUID();
+  const locked = await acquireSyncJobLock(env.DB, {
+    lockRowId: canonicalSyncLockRowId(connectorId),
+    scope,
+    trigger: "manual",
+    runId
   });
+
+  if (!locked) {
+    throw new SyncAlreadyRunningError(connectorId);
+  }
+
+  try {
+    const outcome = await task();
+    await markManualSyncSuccess(env.DB, connectorId, scope);
+    return outcome;
+  } finally {
+    await releaseSyncJobLock(env.DB, canonicalSyncLockRowId(connectorId), runId);
+  }
+}
+
+async function runSchedulerTick(env: Env, controller: ScheduledController) {
+  const runId = crypto.randomUUID();
+  const due = await findNextDueSyncJob(env.DB);
+  if (!due) return;
+
+  const lockRowId = canonicalSyncLockRowId(due.connector_id);
+  const locked = await acquireSyncJobLock(env.DB, {
+    lockRowId,
+    scope: due.scope,
+    trigger: "scheduled",
+    runId
+  });
+  if (!locked) return;
+
+  const startedAt = Date.now();
+  try {
+    const outcome = await runDueSyncJob(env, due);
+    await completeSyncJob(env.DB, due, outcome);
+    console.log(JSON.stringify({
+      event: "sync_run_finished",
+      runId,
+      cron: controller.cron,
+      connectorId: outcome.connectorId,
+      scope: outcome.scope,
+      trigger: "scheduled",
+      status: "success",
+      records: outcome.records,
+      durationMs: Date.now() - startedAt
+    }));
+  } catch (error) {
+    await failSyncJob(env.DB, due, error);
+    console.error(JSON.stringify({
+      event: "sync_run_failed",
+      runId,
+      cron: controller.cron,
+      connectorId: due.connector_id,
+      scope: due.scope,
+      trigger: "scheduled",
+      status: error instanceof NeedsUserActionError ? "needs_user_action" : "failed",
+      message: safeErrorMessage(error),
+      durationMs: Date.now() - startedAt
+    }));
+  } finally {
+    await releaseSyncJobLock(env.DB, lockRowId, runId);
+  }
+}
+
+async function runDueSyncJob(env: Env, job: SyncJobRow) {
+  if (job.connector_id === "einvoice") {
+    return syncEinvoice(env, "scheduled", { fetchDetails: true });
+  }
+
+  if (job.connector_id === "tdcc") {
+    return syncTdcc(env, "scheduled", {}, [job.scope]);
+  }
+
+  if (job.connector_id === "esun") {
+    return syncEsun(env, "scheduled");
+  }
+
+  if (job.connector_id === "cathaybk") {
+    return syncCathaybk(env, "scheduled");
+  }
+
+  throw new NeedsUserActionError("Scheduled connector is not supported.");
+}
+
+async function findNextDueSyncJob(db: D1Database) {
+  const now = new Date().toISOString();
+  const row = await db
+    .prepare(
+      `SELECT *
+       FROM sync_jobs
+       WHERE enabled = 1
+         AND next_run_at <= ?
+       ORDER BY next_run_at ASC, id ASC
+       LIMIT 1`
+    )
+    .bind(now)
+    .first<SyncJobRow>();
+
+  return row ?? null;
+}
+
+async function acquireSyncJobLock(
+  db: D1Database,
+  input: {
+    lockRowId: string;
+    scope: SyncScope;
+    trigger: SyncTrigger;
+    runId: string;
+  }
+) {
+  const now = new Date();
+  const lockedUntil = new Date(now.getTime() + 30 * 60 * 1000).toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE sync_jobs
+       SET locked_by = ?,
+           locked_until = ?,
+           lock_trigger = ?,
+           lock_scope = ?,
+           updated_at = ?
+       WHERE id = ?
+         AND (locked_until IS NULL OR locked_until < ?)`
+    )
+    .bind(input.runId, lockedUntil, input.trigger, input.scope, now.toISOString(), input.lockRowId, now.toISOString())
+    .run();
+
+  return result.meta.changes === 1;
+}
+
+async function releaseSyncJobLock(db: D1Database, lockRowId: string, runId: string) {
+  await db
+    .prepare(
+      `UPDATE sync_jobs
+       SET locked_by = NULL,
+           locked_until = NULL,
+           lock_trigger = NULL,
+           lock_scope = NULL,
+           updated_at = ?
+       WHERE id = ?
+         AND locked_by = ?`
+    )
+    .bind(new Date().toISOString(), lockRowId, runId)
+    .run();
+}
+
+async function completeSyncJob(db: D1Database, job: SyncJobRow, outcome: SyncOutcome) {
+  const now = new Date();
+  const nextRunAt = new Date(now.getTime() + job.interval_minutes * 60 * 1000).toISOString();
+  await db
+    .prepare(
+      `UPDATE sync_jobs
+       SET last_status = 'success',
+           last_error = NULL,
+           last_run_at = ?,
+           last_success_at = ?,
+           next_run_at = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(now.toISOString(), now.toISOString(), nextRunAt, now.toISOString(), job.id)
+    .run();
+
+}
+
+async function failSyncJob(db: D1Database, job: SyncJobRow, error: unknown) {
+  const now = new Date();
+  const status: SyncStatus = error instanceof NeedsUserActionError ? "needs_user_action" : "failed";
+  const enabled = status === "needs_user_action" ? 0 : 1;
+  const nextRunAt = status === "failed"
+    ? new Date(now.getTime() + 60 * 60 * 1000).toISOString()
+    : job.next_run_at;
+
+  await db
+    .prepare(
+      `UPDATE sync_jobs
+       SET last_status = ?,
+           last_error = ?,
+           last_run_at = ?,
+           next_run_at = ?,
+           enabled = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(status, safeErrorMessage(error), now.toISOString(), nextRunAt, enabled, now.toISOString(), job.id)
+    .run();
+
+}
+
+async function markManualSyncSuccess(db: D1Database, connectorId: ConnectorId, scope: SyncScope) {
+  const jobId = `${connectorId}:${scope}`;
+  const job = await db.prepare("SELECT * FROM sync_jobs WHERE id = ?").bind(jobId).first<SyncJobRow>();
+  if (!job) return;
+
+  const now = new Date();
+  const nextRunAt = new Date(now.getTime() + job.interval_minutes * 60 * 1000).toISOString();
+  await db
+    .prepare(
+      `UPDATE sync_jobs
+       SET last_status = 'success',
+           last_error = NULL,
+           last_run_at = ?,
+           last_success_at = ?,
+           next_run_at = ?,
+           updated_at = ?
+       WHERE id = ?`
+    )
+    .bind(now.toISOString(), now.toISOString(), nextRunAt, now.toISOString(), jobId)
+    .run();
+}
+
+function canonicalSyncLockRowId(connectorId: ConnectorId) {
+  return `${connectorId}:all`;
+}
+
+function isUserActionError(error: unknown) {
+  if (error instanceof NeedsUserActionError || error instanceof TdccOtpExpiredError) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /OTP|verification|requires.*login|requires.*session|requires.*user action/i.test(message);
+}
+
+function safeErrorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/\s+/g, " ").slice(0, 300);
 }
 
 api.onError((error) => {
@@ -1991,4 +2419,9 @@ function normalizePosition(position: Omit<InvestmentPosition, "id" | "connectorI
   };
 }
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(runSchedulerTick(env, controller));
+  }
+} satisfies ExportedHandler<Env>;

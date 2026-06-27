@@ -3935,7 +3935,7 @@ function ConnectorPanel({
   });
 
   const updateSyncJob = useMutation({
-    mutationFn: async (payload: { enabled?: boolean; nextRunAt?: string }) => {
+    mutationFn: async (payload: { enabled?: boolean; nextRunAt?: string; intervalMinutes?: number }) => {
       setError("");
       return api.patch<{ success: true; connectorId: ConnectorId; scope: string; enabled: boolean }>(
         `/api/sync-jobs/${connectorId}/all`,
@@ -4175,7 +4175,8 @@ function SyncJobStatus({
   loading,
   updating,
   onToggle,
-  onSchedule
+  onSchedule,
+  onInterval
 }: {
   job?: SyncJobRow;
   loading: boolean;

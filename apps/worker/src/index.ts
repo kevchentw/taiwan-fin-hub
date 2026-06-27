@@ -21,7 +21,8 @@ import {
   type InvestmentTransaction,
   type InvoiceLineItem,
   type NetWorthHistoryPoint,
-  isConnectorId
+  isConnectorId,
+  supportedConnectorIds
 } from "@taiwan-fin-hub/core";
 import {
   getConnectorSettings,
@@ -126,8 +127,10 @@ const bankHistoryRebuildBodySchema = z.object({
 });
 
 const syncJobUpdateSchema = z.object({
-  enabled: z.boolean()
-});
+  enabled: z.boolean().optional(),
+  nextRunAt: z.string().datetime().optional(),
+  intervalMinutes: z.number().int().min(10).optional()
+}).refine(d => d.enabled !== undefined || d.nextRunAt !== undefined || d.intervalMinutes !== undefined);
 
 function jsonError(code: string, message: string, status = 400) {
   return Response.json(
@@ -971,6 +974,17 @@ api.put("/connectors/:connectorId/settings", async (c) => {
 });
 
 api.get("/sync-jobs", async (c) => {
+  const now = new Date().toISOString();
+  const nextDay = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+  await c.env.DB.batch(
+    supportedConnectorIds.map((id) =>
+      c.env.DB.prepare(
+        `INSERT OR IGNORE INTO sync_jobs (id, connector_id, scope, enabled, interval_minutes, next_run_at, created_at, updated_at)
+         VALUES (?, ?, 'all', 0, 1440, ?, ?, ?)`
+      ).bind(`${id}:all`, id, nextDay, now, now)
+    )
+  );
+
   const rows = await c.env.DB.prepare(
     `SELECT
        id,
@@ -1030,11 +1044,20 @@ api.patch("/sync-jobs/:connectorId/:scope", async (c) => {
   const now = new Date().toISOString();
   const result = await c.env.DB.prepare(
     `UPDATE sync_jobs
-     SET enabled = ?,
+     SET enabled = COALESCE(?, enabled),
+         next_run_at = COALESCE(?, next_run_at),
+         interval_minutes = COALESCE(?, interval_minutes),
          updated_at = ?
      WHERE connector_id = ?
        AND scope = ?`
-  ).bind(body.data.enabled ? 1 : 0, now, connectorId, scope).run();
+  ).bind(
+    body.data.enabled !== undefined ? (body.data.enabled ? 1 : 0) : null,
+    body.data.nextRunAt ?? null,
+    body.data.intervalMinutes ?? null,
+    now,
+    connectorId,
+    scope
+  ).run();
 
   if (result.meta.changes !== 1) {
     return jsonError("SYNC_JOB_NOT_FOUND", "Sync job is not configured.", 404);

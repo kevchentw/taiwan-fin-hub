@@ -3935,11 +3935,11 @@ function ConnectorPanel({
   });
 
   const updateSyncJob = useMutation({
-    mutationFn: async (enabled: boolean) => {
+    mutationFn: async (payload: { enabled?: boolean; nextRunAt?: string }) => {
       setError("");
       return api.patch<{ success: true; connectorId: ConnectorId; scope: string; enabled: boolean }>(
         `/api/sync-jobs/${connectorId}/all`,
-        { enabled }
+        payload
       );
     },
     onSuccess: () => {
@@ -4103,7 +4103,9 @@ function ConnectorPanel({
         job={syncJob}
         loading={syncJobs.isLoading}
         updating={updateSyncJob.isPending}
-        onToggle={(enabled) => updateSyncJob.mutate(enabled)}
+        onToggle={(enabled) => updateSyncJob.mutate({ enabled })}
+        onSchedule={(nextRunAt) => updateSyncJob.mutate({ nextRunAt })}
+        onInterval={(intervalMinutes) => updateSyncJob.mutate({ intervalMinutes })}
       />
       <div className="mt-4 grid gap-3">
         {fields.map((field) =>
@@ -4172,12 +4174,15 @@ function SyncJobStatus({
   job,
   loading,
   updating,
-  onToggle
+  onToggle,
+  onSchedule
 }: {
   job?: SyncJobRow;
   loading: boolean;
   updating: boolean;
   onToggle: (enabled: boolean) => void;
+  onSchedule: (nextRunAt: string) => void;
+  onInterval: (intervalMinutes: number) => void;
 }) {
   const statusLabel =
     job?.running
@@ -4190,6 +4195,28 @@ function SyncJobStatus({
             ? "需要處理"
             : "尚未同步";
 
+  const INTERVAL_OPTIONS = [
+    { label: "每小時", minutes: 60 },
+    { label: "每 6 小時", minutes: 360 },
+    { label: "每 12 小時", minutes: 720 },
+    { label: "每天", minutes: 1440 },
+    { label: "每週", minutes: 10080 },
+  ];
+
+  const scheduledTime = job?.nextRunAt
+    ? new Date(job.nextRunAt).toTimeString().slice(0, 5)
+    : "";
+
+  const isDailyOrSlower = (job?.intervalMinutes ?? 1440) >= 1440;
+
+  function handleTimeChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const [h, m] = e.target.value.split(":").map(Number);
+    const d = new Date();
+    d.setHours(h, m, 0, 0);
+    if (d <= new Date()) d.setDate(d.getDate() + 1);
+    onSchedule(d.toISOString());
+  }
+
   return (
     <div className="mt-3 rounded-md border border-ink/10 bg-paper px-3 py-2 text-sm text-ink/70">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -4197,7 +4224,32 @@ function SyncJobStatus({
           <span className="font-medium text-ink/80">自動同步：{loading ? "讀取中" : job?.enabled ? "開" : "關"}</span>
           {job && <span>狀態：{statusLabel}</span>}
           {job?.lastRunAt && <span>上次：{formatDateTime(job.lastRunAt)}</span>}
-          {job?.enabled && job.nextRunAt && <span>下次：{formatDateTime(job.nextRunAt)}</span>}
+          {job?.enabled && (
+            <span className="flex items-center gap-1.5">
+              <select
+                className="rounded border border-ink/15 bg-white px-1 py-0.5 text-xs text-ink/80 disabled:opacity-60"
+                value={INTERVAL_OPTIONS.find(o => o.minutes === job.intervalMinutes)?.minutes ?? 1440}
+                disabled={updating}
+                onChange={(e) => onInterval(Number(e.target.value))}
+              >
+                {INTERVAL_OPTIONS.map(o => (
+                  <option key={o.minutes} value={o.minutes}>{o.label}</option>
+                ))}
+              </select>
+              {isDailyOrSlower && job.nextRunAt && (
+                <>
+                  <input
+                    type="time"
+                    className="rounded border border-ink/15 bg-white px-1 py-0.5 text-xs text-ink/80 disabled:opacity-60"
+                    value={scheduledTime}
+                    disabled={updating}
+                    onChange={handleTimeChange}
+                  />
+                  <span className="text-ink/50">同步</span>
+                </>
+              )}
+            </span>
+          )}
         </div>
         {job && (
           <button

@@ -192,6 +192,25 @@ interface ConnectorSettings {
   publicConfig?: Record<string, unknown> | null;
 }
 
+interface SyncJobRow {
+  id: string;
+  connectorId: ConnectorId;
+  scope: string;
+  enabled: boolean;
+  intervalMinutes: number;
+  nextRunAt: string;
+  lockedUntil: string | null;
+  lockedBy: string | null;
+  lockTrigger: "manual" | "scheduled" | null;
+  lockScope: string | null;
+  lastRunAt: string | null;
+  lastSuccessAt: string | null;
+  lastStatus: "success" | "failed" | "needs_user_action" | null;
+  lastError: string | null;
+  updatedAt: string;
+  running: boolean;
+}
+
 interface ApiError {
   success: false;
   error: {
@@ -3864,6 +3883,11 @@ function ConnectorPanel({
     queryKey: ["connector-settings", connectorId],
     queryFn: () => api.get<ConnectorSettings>(`/api/connectors/${connectorId}/settings`)
   });
+  const syncJobs = useQuery({
+    queryKey: ["sync-jobs"],
+    queryFn: () => api.get<SyncJobRow[]>("/api/sync-jobs")
+  });
+  const syncJob = syncJobs.data?.find((job) => job.connectorId === connectorId && job.scope === "all");
 
   useEffect(() => {
     const pub = settings.data?.publicConfig;
@@ -3909,6 +3933,21 @@ function ConnectorPanel({
     },
     onError: (mutationError) => setError(messageFromError(mutationError))
   });
+
+  const updateSyncJob = useMutation({
+    mutationFn: async (payload: { enabled?: boolean; nextRunAt?: string; intervalMinutes?: number }) => {
+      setError("");
+      return api.patch<{ success: true; connectorId: ConnectorId; scope: string; enabled: boolean }>(
+        `/api/sync-jobs/${connectorId}/all`,
+        payload
+      );
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["sync-jobs"] });
+    },
+    onError: (mutationError) => setError(messageFromError(mutationError))
+  });
+
   function syncPath(target: SyncTarget) {
     if (connectorId !== "tdcc" || target === "default") {
       return `/api/connectors/${connectorId}/sync`;
@@ -3952,7 +3991,10 @@ function ConnectorPanel({
       setError("");
       setPendingSyncTarget(target ?? "default");
     },
-    onSuccess: (_data, target) => invalidateAfterSync(target ?? "default"),
+    onSuccess: (_data, target) => {
+      invalidateAfterSync(target ?? "default");
+      queryClient.invalidateQueries({ queryKey: ["sync-jobs"] });
+    },
     onError: (mutationError) => setError(messageFromError(mutationError))
   });
   const syncErrorMessage = sync.isError ? messageFromError(sync.error) : "";
@@ -3977,6 +4019,7 @@ function ConnectorPanel({
       setOtpForced(false);
       sync.reset();
       queryClient.invalidateQueries({ queryKey: ["connector-settings", connectorId] });
+      queryClient.invalidateQueries({ queryKey: ["sync-jobs"] });
       invalidateAfterSync(pendingSyncTarget);
     },
     onError: (mutationError) => setError(messageFromError(mutationError))
@@ -4056,6 +4099,14 @@ function ConnectorPanel({
       {connectorId !== "tdcc" && (
         <p className="mt-3 text-xs text-ink/55">輸入完帳號密碼後，請先按「儲存設定」，再按「同步」。</p>
       )}
+      <SyncJobStatus
+        job={syncJob}
+        loading={syncJobs.isLoading}
+        updating={updateSyncJob.isPending}
+        onToggle={(enabled) => updateSyncJob.mutate({ enabled })}
+        onSchedule={(nextRunAt) => updateSyncJob.mutate({ nextRunAt })}
+        onInterval={(intervalMinutes) => updateSyncJob.mutate({ intervalMinutes })}
+      />
       <div className="mt-4 grid gap-3">
         {fields.map((field) =>
           field.type === "checkbox" ? (
@@ -4117,6 +4168,112 @@ function ConnectorPanel({
       )}
     </article>
   );
+}
+
+function SyncJobStatus({
+  job,
+  loading,
+  updating,
+  onToggle,
+  onSchedule,
+  onInterval
+}: {
+  job?: SyncJobRow;
+  loading: boolean;
+  updating: boolean;
+  onToggle: (enabled: boolean) => void;
+  onSchedule: (nextRunAt: string) => void;
+  onInterval: (intervalMinutes: number) => void;
+}) {
+  const statusLabel =
+    job?.running
+      ? `同步中${job.lockScope ? `（${syncScopeLabel(job.lockScope)}）` : ""}`
+      : job?.lastStatus === "success"
+        ? "正常"
+        : job?.lastStatus === "failed"
+          ? "失敗"
+          : job?.lastStatus === "needs_user_action"
+            ? "需要處理"
+            : "尚未同步";
+
+  const INTERVAL_OPTIONS = [
+    { label: "每小時", minutes: 60 },
+    { label: "每 6 小時", minutes: 360 },
+    { label: "每 12 小時", minutes: 720 },
+    { label: "每天", minutes: 1440 },
+    { label: "每週", minutes: 10080 },
+  ];
+
+  const scheduledTime = job?.nextRunAt
+    ? new Date(job.nextRunAt).toTimeString().slice(0, 5)
+    : "";
+
+  const isDailyOrSlower = (job?.intervalMinutes ?? 1440) >= 1440;
+
+  function handleTimeChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const [h, m] = e.target.value.split(":").map(Number);
+    const d = new Date();
+    d.setHours(h, m, 0, 0);
+    if (d <= new Date()) d.setDate(d.getDate() + 1);
+    onSchedule(d.toISOString());
+  }
+
+  return (
+    <div className="mt-3 rounded-md border border-ink/10 bg-paper px-3 py-2 text-sm text-ink/70">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span className="font-medium text-ink/80">自動同步：{loading ? "讀取中" : job?.enabled ? "開" : "關"}</span>
+          {job && <span>狀態：{statusLabel}</span>}
+          {job?.lastRunAt && <span>上次：{formatDateTime(job.lastRunAt)}</span>}
+          {job?.enabled && (
+            <span className="flex items-center gap-1.5">
+              <select
+                className="rounded border border-ink/15 bg-white px-1 py-0.5 text-xs text-ink/80 disabled:opacity-60"
+                value={INTERVAL_OPTIONS.find(o => o.minutes === job.intervalMinutes)?.minutes ?? 1440}
+                disabled={updating}
+                onChange={(e) => onInterval(Number(e.target.value))}
+              >
+                {INTERVAL_OPTIONS.map(o => (
+                  <option key={o.minutes} value={o.minutes}>{o.label}</option>
+                ))}
+              </select>
+              {isDailyOrSlower && job.nextRunAt && (
+                <>
+                  <input
+                    type="time"
+                    className="rounded border border-ink/15 bg-white px-1 py-0.5 text-xs text-ink/80 disabled:opacity-60"
+                    value={scheduledTime}
+                    disabled={updating}
+                    onChange={handleTimeChange}
+                  />
+                  <span className="text-ink/50">同步</span>
+                </>
+              )}
+            </span>
+          )}
+        </div>
+        {job && (
+          <button
+            className="rounded-md border border-ink/15 bg-white px-2.5 py-1 text-xs font-medium text-ink/75 transition hover:border-steel hover:text-steel disabled:opacity-60"
+            disabled={updating}
+            onClick={() => onToggle(!job.enabled)}
+          >
+            {job.enabled ? "關閉" : "開啟"}
+          </button>
+        )}
+      </div>
+      {job?.lastError && (
+        <p className="mt-1 text-xs text-coral">{job.lastError}</p>
+      )}
+    </div>
+  );
+}
+
+function syncScopeLabel(scope: string) {
+  if (scope === "investments") return "投資";
+  if (scope === "bank") return "銀行";
+  if (scope === "trades") return "交易";
+  return scope;
 }
 
 function NavButton({
@@ -4284,6 +4441,7 @@ interface ApiClient {
   get<TValue>(path: string): Promise<TValue>;
   post<TValue>(path: string, body?: unknown): Promise<TValue>;
   put<TValue>(path: string, body: unknown): Promise<TValue>;
+  patch<TValue>(path: string, body: unknown): Promise<TValue>;
   delete<TValue>(path: string): Promise<TValue>;
 }
 
@@ -4307,6 +4465,7 @@ function createApiClient(): ApiClient {
     get: (path) => request(path),
     post: (path, body) => request(path, { method: "POST", body: body ? JSON.stringify(body) : undefined }),
     put: (path, body) => request(path, { method: "PUT", body: JSON.stringify(body) }),
+    patch: (path, body) => request(path, { method: "PATCH", body: JSON.stringify(body) }),
     delete: (path) => request(path, { method: "DELETE" })
   };
 }

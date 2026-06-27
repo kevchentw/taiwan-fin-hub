@@ -1121,7 +1121,7 @@ async function syncEinvoice(
   const connectorId = "einvoice";
   const scope = "all";
   const settings = await requireConnectorSettings(env.DB, connectorId);
-  const config = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
+  const config = await decryptJson<unknown>(settings.encrypted_config, configEncryptionKey(env));
   const parsedConfig = parseInvoiceConfig({ ...(config as Record<string, unknown>), ...overrides });
   const originalInvoiceConfig = invoiceConfigSnapshot(config as { fetchDetails?: boolean; userToken?: string; mobileBarcode?: string });
   console.log(`[sync] ${connectorId}/${scope}: starting trigger=${trigger} (cursor=${settings.sync_cursor ?? "none"})`);
@@ -1186,7 +1186,7 @@ async function syncEinvoice(
         `UPDATE connector_settings
         SET encrypted_config = ?, updated_at = ?
         WHERE connector_id = ?`
-      ).bind(await encryptJson(parsedConfig, env.CONFIG_ENCRYPTION_KEY), now, connectorId)
+      ).bind(await encryptJson(parsedConfig, configEncryptionKey(env)), now, connectorId)
     );
   }
 
@@ -1208,7 +1208,7 @@ async function syncEsun(env: Env, trigger: SyncTrigger): Promise<SyncOutcome> {
   const connectorId = "esun";
   const scope = "all";
   const settings = await requireConnectorSettings(env.DB, connectorId);
-  const stored = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
+  const stored = await decryptJson<unknown>(settings.encrypted_config, configEncryptionKey(env));
   const config = parseEsunConfig(stored);
 
   if (
@@ -1240,7 +1240,7 @@ async function syncEsun(env: Env, trigger: SyncTrigger): Promise<SyncOutcome> {
     const updatedConfig = { ...config, ...JSON.parse(result.cursor) };
     statements.push(
       env.DB.prepare(`UPDATE connector_settings SET encrypted_config = ?, sync_cursor = ?, updated_at = ? WHERE connector_id = ?`)
-        .bind(await encryptJson(updatedConfig, env.CONFIG_ENCRYPTION_KEY), result.cursor, now, connectorId)
+        .bind(await encryptJson(updatedConfig, configEncryptionKey(env)), result.cursor, now, connectorId)
     );
   }
 
@@ -1265,7 +1265,7 @@ async function syncCathaybk(env: Env, trigger: SyncTrigger): Promise<SyncOutcome
   const connectorId = "cathaybk";
   const scope = "all";
   const settings = await requireConnectorSettings(env.DB, connectorId);
-  const stored = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
+  const stored = await decryptJson<unknown>(settings.encrypted_config, configEncryptionKey(env));
   const publicStored = settings.public_config ? JSON.parse(settings.public_config) : {};
   const config = parseCathaybkConfig({ ...(stored as object), ...publicStored });
 
@@ -1292,7 +1292,7 @@ async function syncCathaybk(env: Env, trigger: SyncTrigger): Promise<SyncOutcome
     const updatedConfig = { ...config, ...cursorState };
     statements.push(
       env.DB.prepare(`UPDATE connector_settings SET encrypted_config = ?, sync_cursor = ?, updated_at = ? WHERE connector_id = ?`)
-        .bind(await encryptJson(updatedConfig, env.CONFIG_ENCRYPTION_KEY), result.cursor, now, connectorId)
+        .bind(await encryptJson(updatedConfig, configEncryptionKey(env)), result.cursor, now, connectorId)
     );
   }
 
@@ -1363,7 +1363,7 @@ async function syncTdccPositionsAndBank(
 ): Promise<{ records: number; cursorUpdated: boolean }> {
   const connectorId = "tdcc";
   const settings = await requireConnectorSettings(env.DB, connectorId);
-  const config = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
+  const config = await decryptJson<unknown>(settings.encrypted_config, configEncryptionKey(env));
   const mergedConfig = { ...(config as Record<string, unknown>), ...overrides };
   const parsedConfig = parseTdccConfig(mergedConfig);
   const syncScope = options.scope;
@@ -1428,7 +1428,7 @@ async function syncTdccTrades(
 ): Promise<{ records: number; cursorUpdated: boolean }> {
   const connectorId = "tdcc";
   const settings = await requireConnectorSettings(env.DB, connectorId);
-  const config = await decryptJson<unknown>(settings.encrypted_config, env.CONFIG_ENCRYPTION_KEY);
+  const config = await decryptJson<unknown>(settings.encrypted_config, configEncryptionKey(env));
   const mergedConfig = { ...(config as Record<string, unknown>), ...overrides };
   const parsedConfig = parseTdccConfig(mergedConfig);
   console.log(`[sync] ${connectorId}/${scope}: starting trigger=${trigger} (cursor=${settings.sync_cursor ?? "none"})`);
@@ -1490,7 +1490,8 @@ async function handleTdccSyncError(
     await upsertConnectorSettings(env.DB, {
       id: settingsId,
       connectorId,
-      encryptedConfig: await encryptJson(configWithoutOtp, env.CONFIG_ENCRYPTION_KEY),
+      encryptedConfig: await encryptJson(configWithoutOtp, configEncryptionKey(env)),
+      publicConfig: null,
       now: new Date().toISOString()
     });
     console.log(`[sync] ${connectorId}/${scope}: cleared expired otp from config`);

@@ -79,8 +79,13 @@ async function scrapeWithBrowser(browserBinding: Fetcher, config: CtbcbankConfig
 
 async function login(page: Page, config: CtbcbankConfig) {
   console.log("[ctbcbank] navigating to login page");
-  await page.goto(LOGIN_URL, { waitUntil: "networkidle2", timeout: 60000 });
-  await page.waitForSelector('[name="personalId"]', { timeout: 15000 });
+  await page.goto(LOGIN_URL, { waitUntil: "load", timeout: 60000 });
+  const landedUrl = page.url();
+  const landedTitle = await page.title().catch(() => "");
+  const landedBody = await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").trim().slice(0, 200)).catch(() => "");
+  console.log(`[ctbcbank] landed url=${landedUrl} title="${landedTitle}" body="${landedBody}"`);
+  // ponytail: AngularJS bootstraps the form after load; 30s covers slow CF cold-starts
+  await page.waitForSelector('[name="personalId"]', { timeout: 30000 });
 
   await page.click('[name="personalId"]', { clickCount: 3 });
   await page.type('[name="personalId"]', config.userId!.toUpperCase());

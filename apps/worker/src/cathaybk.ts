@@ -67,7 +67,7 @@ async function scrapeWithBrowser(browserBinding: Fetcher, config: CathaybkConfig
     const deposits = await scrapeDeposits(page, lookbackDays);
 
     console.log("[cathaybk] collecting credit cards");
-    const cards = await scrapeCreditCards(page);
+    const cards = await scrapeCreditCards(page, config.lookbackMonths ?? 1);
 
     const freshCookies = JSON.stringify(await page.cookies());
 
@@ -406,62 +406,63 @@ function appendDepositTransactions(
 
 // ---- Credit cards ----
 
-async function scrapeCreditCards(page: Page): Promise<Scraped> {
+interface HistoryBillItem {
+  billDate: string;
+  twdAmount: number | null;
+  usdAmount: number | null;
+  billStatus: string;
+}
+
+interface TradeItem {
+  consumeDate: string | null;
+  transDesc: string;
+  amount: number;
+  currency: string;
+}
+
+interface BillDetailSection {
+  detailType: string;
+  tradeData: TradeItem[] | null;
+}
+
+interface MonthDetail {
+  billDate: string;
+  twdAmount: number | null;
+  sections: BillDetailSection[];
+}
+
+async function scrapeCreditCards(page: Page, lookbackMonths: number): Promise<Scraped> {
   const bankAccounts: Scraped["bankAccounts"] = [];
   const bankBalanceSnapshots: Scraped["bankBalanceSnapshots"] = [];
   const bankTransactions: Scraped["bankTransactions"] = [];
+  const creditCardBills: Scraped["creditCardBills"] = [];
   const asOfAt = new Date().toISOString();
 
-  // Card overview (C0101) — scrape from DOM
+  // ── C0101: card overview (DOM) ─────────────────────────────────────────
   await page.goto(CREDIT_CARD_OVERVIEW_URL, { waitUntil: "networkidle2", timeout: 60000 });
-  console.log(`[cathaybk] credit card page url: ${page.url()}`);
+  console.log(`[cathaybk] credit card overview url: ${page.url()}`);
   await new Promise(r => setTimeout(r, 2000));
 
   const cardOverview = await page.evaluate(() => {
     const text = document.body.innerText;
     const parseAmt = (s: string | undefined) => parseInt((s ?? "").replace(/[^\d]/g, ""), 10) || 0;
-
     const last4Match = text.match(/卡片末四碼[：:]\s*(\d{4})/);
     const cardNameMatch = text.match(/([^\n]+?(?:MasterCard|VISA|JCB|銀聯)[^\n]*)/);
     const limitMatch = text.match(/永久信用額度\s*(?:TWD\s*)?([\d,]+)/);
     const availMatch = text.match(/剩餘可用額度[\s\S]{0,20}?(?:TWD\s*)?([\d,]+)/);
     const dueDateMatch = text.match(/繳款截止日[\s\S]{0,10}?(\d{4}[\/\-]\d{2}[\/\-]\d{2})/);
-
-    // Statement balance from most recent bill line (e.g. "2026年06月 臺幣帳單 ... -TWD 1,135")
-    const billLineMatch = text.match(/\d{4}年\d{2}月[\s\S]{0,60}?(-?TWD\s*[\d,]+)/);
-    const billRaw = billLineMatch?.[1]?.trim() ?? "";
-    const billIsNeg = billRaw.startsWith("-");
-    const statementBalance = billIsNeg ? -parseAmt(billRaw) : parseAmt(billRaw);
-
-    // 未繳餘額: "無需繳費" → 0, otherwise extract from 應繳/未繳 line
     const noPaymentNeeded = text.includes("無需繳費");
     const unpaidMatch = !noPaymentNeeded
       ? text.match(/(?:應繳|未繳)(?:金額|餘額)?[\s\S]{0,20}?(?:TWD\s*)?([\d,]+)/)
       : null;
-    const unpaidAmount = noPaymentNeeded ? 0 : parseAmt(unpaidMatch?.[1]);
-
-    // Scrape all historical bill rows: "YYYY年MM月 ... -TWD X,XXX"
-    const billRows: Array<{ billingPeriod: string; statementAmount: number }> = [];
-    const seen = new Set<string>();
-    const billRegex = /(\d{4})年(\d{2})月[\s\S]{0,100}?(-?TWD\s*[\d,]+)/g;
-    let m: RegExpExecArray | null;
-    while ((m = billRegex.exec(text)) !== null) {
-      const period = `${m[1]}-${m[2]}`;
-      if (seen.has(period)) continue;
-      seen.add(period);
-      billRows.push({ billingPeriod: period, statementAmount: parseAmt(m[3]) });
-    }
-
     return {
       last4: last4Match?.[1] ?? "",
       cardName: last4Match ? `國泰信用卡 末四碼 ${last4Match[1]}` : (cardNameMatch?.[1]?.trim() ?? "國泰信用卡"),
       creditLimit: parseAmt(limitMatch?.[1]),
       availableCredit: parseAmt(availMatch?.[1]),
-      statementBalance,    // 帳單金額（負數 = 消費；正數 = 退刷回沖）
-      unpaidAmount,         // 未繳餘額（0 = 無需繳費）
+      unpaidAmount: noPaymentNeeded ? 0 : parseAmt(unpaidMatch?.[1]),
       paymentDueDate: dueDateMatch?.[1]?.replace(/\//g, "-") ?? null,
       noPaymentNeeded,
-      billRows
     };
   });
 
@@ -483,10 +484,8 @@ async function scrapeCreditCards(page: Page): Promise<Scraped> {
   bankBalanceSnapshots.push({
     accountId: sourceId,
     sourceId: `${sourceId}:${asOfAt}`,
-    // balance = unpaid amount (negative = money owed); 0 when no payment needed
     balance: -cardOverview.unpaidAmount,
     availableBalance: cardOverview.availableCredit || undefined,
-    statementBalance: cardOverview.statementBalance || undefined,
     paymentDueDate: cardOverview.paymentDueDate ?? undefined,
     noPaymentNeeded: cardOverview.noPaymentNeeded,
     currency: "TWD",
@@ -494,62 +493,127 @@ async function scrapeCreditCards(page: Page): Promise<Scraped> {
     raw: cardOverview
   });
 
-  // Bill transactions (C0102) — scrape from DOM table
+  // ── C0102: bill history + transactions via OnlineBankingApi ───────────
   await page.goto(CREDIT_CARD_BILL_URL, { waitUntil: "networkidle2", timeout: 60000 });
   await new Promise(r => setTimeout(r, 2000));
 
-  const billTxns = await page.evaluate(() => {
-    const results: Array<{date: string; desc: string; amount: number}> = [];
-    const rows = Array.from(document.querySelectorAll("tr, [role='row']"));
-    for (const row of rows) {
-      const cells = Array.from(row.querySelectorAll("td, [role='cell']"));
-      if (cells.length < 3) continue;
-      const dateText = cells[0]?.textContent?.trim() ?? "";
-      const descText = cells[1]?.textContent?.trim() ?? "";
-      const amtText = cells[2]?.textContent?.trim() ?? "";
-      if (!/\d{4}[\/\-]\d{2}/.test(dateText)) continue;
-      const amt = parseInt(amtText.replace(/[^\d]/g, ""), 10) || 0;
-      if (amt === 0 || !descText) continue;
-      results.push({ date: dateText, desc: descText, amount: amt });
+  const apiResult = await page.evaluate(async (maxMonths: number) => {
+    // Get JWT + customerId
+    const jwtData = await new Promise<{ token: string; customerId: string }>((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/MyBank/Customized/GetJWT");
+      xhr.withCredentials = true;
+      xhr.onload = () => {
+        try {
+          const d = JSON.parse(xhr.responseText).Data;
+          resolve({ token: d.JwtToken, customerId: d.CustomerId });
+        } catch { resolve({ token: "", customerId: "" }); }
+      };
+      xhr.onerror = () => resolve({ token: "", customerId: "" });
+      xhr.send();
+    });
+
+    if (!jwtData.token) return null;
+
+    const { token: jwt, customerId } = jwtData;
+
+    // ponytail: functionSeqNo format observed from browser: YYYYMMDDHHmmss + UUID
+    const now = new Date();
+    const p = (n: number) => String(n).padStart(2, "0");
+    const functionSeqNo = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}${crypto.randomUUID()}`;
+
+    function xhrPost(endpoint: string, extra: Record<string, unknown> = {}): Promise<unknown> {
+      return new Promise((resolve) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", `/OnlineBankingApi/ClientCard/Api/ClientCard/${endpoint}`);
+        xhr.withCredentials = true;
+        xhr.setRequestHeader("Content-Type", "application/json");
+        xhr.setRequestHeader("Authorization", `Bearer ${jwt}`);
+        xhr.onload = () => { try { resolve(JSON.parse(xhr.responseText)); } catch { resolve(null); } };
+        xhr.onerror = () => resolve(null);
+        xhr.send(JSON.stringify({ functionSeqNo, content: { customerId, ...extra } }));
+      });
     }
-    return results;
-  });
 
-  console.log(`[cathaybk] credit card bill transactions: ${billTxns.length}`);
+    // 1. Get list of available historical months (bank provides up to 12)
+    const historyResp = await xhrPost("C_BILL_Q_HistoryBillList") as {
+      content?: { historyBillInfoList?: unknown[] };
+    } | null;
+    const allBills = (historyResp?.content?.historyBillInfoList ?? []) as Array<{
+      billDate: string; twdAmount: number | null; usdAmount: number | null; billStatus: string;
+    }>;
 
-  const seen = new Map<string, number>();
-  for (const txn of billTxns) {
-    const date = normalizeDateStr(txn.date);
-    const key = [date, sourceId, txn.amount, txn.desc].join(":");
-    const occ = (seen.get(key) ?? 0) + 1;
-    seen.set(key, occ);
-    bankTransactions.push({
+    const targetBills = allBills.slice(0, maxMonths);
+
+    // 2. Get transaction details for each month
+    const monthDetails: Array<{ billDate: string; twdAmount: number | null; sections: unknown[] }> = [];
+    for (const bill of targetBills) {
+      const detail = await xhrPost("C_BILL_Q_RecentBillDetail", { billDate: bill.billDate }) as {
+        content?: { twdBillDetailInfo?: unknown[] };
+      } | null;
+      monthDetails.push({
+        billDate: bill.billDate,
+        twdAmount: bill.twdAmount,
+        sections: detail?.content?.twdBillDetailInfo ?? []
+      });
+    }
+
+    return { allBills: targetBills, monthDetails };
+  }, lookbackMonths) as { allBills: HistoryBillItem[]; monthDetails: MonthDetail[] } | null;
+
+  if (!apiResult) {
+    console.log("[cathaybk] credit card API failed — no bill data");
+    return { bankAccounts, bankBalanceSnapshots, bankTransactions, creditCardBills };
+  }
+
+  console.log(`[cathaybk] fetched ${apiResult.allBills.length} historical bills`);
+
+  // Build creditCardBills from history list
+  const latestBillDate = apiResult.allBills[0]?.billDate;
+  for (const bill of apiResult.allBills) {
+    const period = bill.billDate.slice(0, 7); // "YYYY-MM"
+    const isLatest = bill.billDate === latestBillDate;
+    creditCardBills.push({
       accountId: sourceId,
-      sourceId: `${key}:${occ}`,
-      postedDate: date,
-      amount: -txn.amount, // spending = negative
+      sourceId: `${sourceId}:bill:${period}`,
+      billingPeriod: period,
+      statementAmount: bill.twdAmount != null ? Math.abs(bill.twdAmount) : undefined,
+      statementClosingDate: bill.billDate.slice(0, 10),
+      paymentDueDate: isLatest ? (cardOverview.paymentDueDate ?? undefined) : undefined,
+      isPaid: isLatest ? cardOverview.noPaymentNeeded : true,
       currency: "TWD",
-      description: txn.desc,
-      raw: { ...txn, duplicateOccurrence: occ }
+      raw: bill
     });
   }
 
-  // Build credit card bills from the scraped overview bill rows
-  const firstPeriod = cardOverview.billRows[0]?.billingPeriod;
-  const creditCardBills: Scraped["creditCardBills"] = cardOverview.billRows.map((row) => {
-    const isCurrent = row.billingPeriod === firstPeriod;
-    return {
-      accountId: sourceId,
-      sourceId: `${sourceId}:bill:${row.billingPeriod}`,
-      billingPeriod: row.billingPeriod,
-      statementAmount: row.statementAmount || undefined,
-      paymentDueDate: isCurrent ? (cardOverview.paymentDueDate ?? undefined) : undefined,
-      isPaid: isCurrent ? cardOverview.noPaymentNeeded : true,
-      currency: "TWD",
-      raw: row
-    };
-  });
   console.log(`[cathaybk] credit card bills: ${creditCardBills.length}`);
+
+  // Build bankTransactions from bill details (skip carry-forward summary rows)
+  const seen = new Map<string, number>();
+  for (const month of apiResult.monthDetails) {
+    for (const section of (month.sections as BillDetailSection[])) {
+      if (section.detailType === "LastBillAmount") continue;
+      for (const trade of (section.tradeData ?? [])) {
+        if (!trade.amount) continue;
+        const date = normalizeDateStr(trade.consumeDate ?? month.billDate);
+        const desc = trade.transDesc || "國泰信用卡消費";
+        const key = [date, sourceId, trade.amount, desc].join(":");
+        const occ = (seen.get(key) ?? 0) + 1;
+        seen.set(key, occ);
+        bankTransactions.push({
+          accountId: sourceId,
+          sourceId: `${key}:${occ}`,
+          postedDate: date,
+          amount: trade.amount < 0 ? trade.amount : -trade.amount,
+          currency: "TWD",
+          description: desc,
+          raw: { ...trade, billDate: month.billDate, detailType: section.detailType, duplicateOccurrence: occ }
+        });
+      }
+    }
+  }
+
+  console.log(`[cathaybk] credit card transactions: ${bankTransactions.length}`);
 
   return { bankAccounts, bankBalanceSnapshots, bankTransactions, creditCardBills };
 }

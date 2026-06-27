@@ -2339,6 +2339,8 @@ function Cards({ api }: { api: ApiClient }) {
     cards: groupCards,
     outstandingByCurrency: sumAccountsByCurrency(groupCards.map((c) => ({ ...c, balance: c.balance != null ? Math.abs(c.balance) : undefined })), "balance"),
     availableByCurrency: sumAccountsByCurrency(groupCards, "availableBalance"),
+    paymentDueDate: groupCards.find((c) => c.paymentDueDate)?.paymentDueDate,
+    statementClosingDate: groupCards.find((c) => c.statementClosingDate)?.statementClosingDate,
     latestAsOf: groupCards.reduce<string>((latest, c) => c.asOfAt && c.asOfAt > latest ? c.asOfAt : latest, "")
   })).sort((a, b) => a.name.localeCompare(b.name, "zh-TW"));
 
@@ -2360,16 +2362,36 @@ function Cards({ api }: { api: ApiClient }) {
           <div className="grid gap-3">
             {cardGroups.map((group) => (
               <article key={group.name} className="overflow-hidden rounded-xl border border-ink/10 bg-white shadow-sm">
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink/8 bg-ink px-4 py-3 text-white">
-                  <div className="min-w-0">
-                    <h3 className="truncate font-semibold">{group.name}</h3>
-                    <p className="text-xs text-white/65">
-                      {group.cards.length} 張信用卡{group.latestAsOf ? ` · 更新 ${formatDate(group.latestAsOf)}` : ""}
-                    </p>
-                  </div>
-                  <div className="text-right text-sm text-white">
-                    <p className="font-semibold tabular-nums">已用 {formatCurrencyTotals(group.outstandingByCurrency)}</p>
-                    <p className="text-xs text-white/65 tabular-nums">可用 {formatCurrencyTotals(group.availableByCurrency)}</p>
+                <div className="border-b border-ink/8 bg-ink px-4 py-3 text-white">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <h3 className="truncate font-semibold">{group.name}</h3>
+                      <p className="text-xs text-white/65">
+                        {group.cards.length} 張信用卡{group.latestAsOf ? ` · 資料更新 ${formatDate(group.latestAsOf)}` : ""}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-x-6 gap-y-1 text-right text-sm">
+                      <div>
+                        <p className="text-[11px] text-white/50">已用</p>
+                        <p className="font-semibold tabular-nums">{formatCurrencyTotals(group.outstandingByCurrency)}</p>
+                      </div>
+                      <div>
+                        <p className="text-[11px] text-white/50">可用</p>
+                        <p className="font-semibold tabular-nums">{formatCurrencyTotals(group.availableByCurrency)}</p>
+                      </div>
+                      {group.paymentDueDate && (
+                        <div>
+                          <p className="text-[11px] text-white/50">繳款截止</p>
+                          <p>{group.paymentDueDate}</p>
+                        </div>
+                      )}
+                      {group.statementClosingDate && (
+                        <div>
+                          <p className="text-[11px] text-white/50">帳單截止</p>
+                          <p>{group.statementClosingDate}</p>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
                 <div className="divide-y divide-ink/8">
@@ -2377,33 +2399,9 @@ function Cards({ api }: { api: ApiClient }) {
                     const cardBills = [...(billsByAccountId[card.id] ?? [])].sort((a, b) => b.billingPeriod.localeCompare(a.billingPeriod));
                     return (
                       <div key={card.id}>
-                        <div className="grid gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-medium">{card.accountName ?? card.sourceId}</p>
-                            <p className="text-xs text-ink/45">信用卡{card.accountLast4 ? ` · 末四 ${card.accountLast4}` : ""}</p>
-                          </div>
-                          <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm sm:justify-end">
-                            <div className="sm:text-right">
-                              <p className="text-[11px] font-medium uppercase text-ink/40">已用</p>
-                              <p className="font-semibold tabular-nums">{card.balance != null ? formatCurrency(Math.abs(card.balance), card.currency) : "-"}</p>
-                            </div>
-                            <div className="sm:text-right">
-                              <p className="text-[11px] font-medium uppercase text-ink/40">可用</p>
-                              <p className="font-semibold tabular-nums">{card.availableBalance != null ? formatCurrency(card.availableBalance, card.currency) : "-"}</p>
-                            </div>
-                            <div className="sm:text-right">
-                              <p className="text-[11px] font-medium uppercase text-ink/40">繳款截止</p>
-                              <p>{card.paymentDueDate ?? "-"}</p>
-                            </div>
-                            <div className="sm:text-right">
-                              <p className="text-[11px] font-medium uppercase text-ink/40">帳單截止</p>
-                              <p>{card.statementClosingDate ?? "-"}</p>
-                            </div>
-                            <div className="sm:text-right">
-                              <p className="text-[11px] font-medium uppercase text-ink/40">截至時間</p>
-                              <p className="text-ink/45">{card.asOfAt ? formatDate(card.asOfAt) : "-"}</p>
-                            </div>
-                          </div>
+                        <div className="px-4 py-3">
+                          <p className="truncate text-sm font-medium">{card.accountName ?? card.sourceId}</p>
+                          <p className="text-xs text-ink/45">信用卡{card.accountLast4 ? ` · 末四 ${card.accountLast4}` : ""}</p>
                         </div>
                         {cardBills.length > 0 && (
                           <div className="border-t border-ink/5 bg-paper">

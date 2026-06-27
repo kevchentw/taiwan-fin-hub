@@ -2291,6 +2291,11 @@ function Investments({ api }: { api: ApiClient }) {
 }
 
 function Cards({ api }: { api: ApiClient }) {
+  const [search, setSearch] = useState("");
+  const [cardFilter, setCardFilter] = useState("all");
+  const [flowFilter, setFlowFilter] = useState<"all" | "inflow" | "outflow">("all");
+  const [dateRange, setDateRange] = useState<BankDateRange>("month");
+
   const bank = useQuery({
     queryKey: ["bank"],
     queryFn: () => api.get<BankData>("/api/bank")
@@ -2390,25 +2395,84 @@ function Cards({ api }: { api: ApiClient }) {
           </div>
         );
       })()}
-      <div>
-        <h2 className="mb-3 text-lg font-semibold">刷卡交易</h2>
-        <Table
-          columns={["日期", "卡片", "說明", "交易對象", "金額"]}
-          rows={cardTransactions.map((transaction) => [
-            transaction.postedDate
-              ? formatDateTime(transaction.postedDate)
-              : transaction.authorizedAt
-                ? formatDateTime(transaction.authorizedAt)
-                : "-",
-            transaction.accountName ?? transaction.accountId,
-            transaction.description ?? "-",
-            transaction.counterparty ?? "-",
-            <span className={transaction.amount > 0 ? "text-red-600" : "text-moss"}>
-              {formatCurrency(transaction.amount, transaction.currency)}
-            </span>
-          ])}
-          empty="尚無刷卡交易。"
-        />
+      <div className="rounded-xl border border-ink/10 bg-white shadow-sm">
+        <div className="flex flex-col gap-3 border-b border-ink/8 px-4 py-4">
+          <div className="flex items-center justify-between gap-4">
+            <h2 className="text-lg font-semibold">刷卡交易</h2>
+          </div>
+          <label className="flex items-center gap-2 rounded-md border border-ink/15 bg-paper px-3 py-2">
+            <Search className="h-4 w-4 shrink-0 text-steel" aria-hidden="true" />
+            <input
+              className="w-full bg-transparent text-sm outline-none"
+              placeholder="搜尋說明或交易對象"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+          </label>
+          <div className="no-scrollbar flex gap-2 overflow-x-auto pb-1">
+            {BANK_DATE_RANGES.map((range) => (
+              <button
+                key={range}
+                type="button"
+                onClick={() => setDateRange(range)}
+                className={`shrink-0 rounded-md border px-3 py-1.5 text-sm font-medium ${dateRange === range ? "border-ink bg-ink text-white" : "border-ink/15 bg-paper text-ink/60"}`}
+              >
+                {dateRangeLabel(range)}
+              </button>
+            ))}
+          </div>
+          <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+            <select
+              className="min-w-0 rounded-md border border-ink/15 bg-paper px-3 py-2 text-sm outline-none"
+              value={cardFilter}
+              onChange={(e) => setCardFilter(e.target.value)}
+            >
+              <option value="all">全部卡片</option>
+              {cards.map((card) => (
+                <option key={card.id} value={card.id}>
+                  {[card.institutionName, card.accountName ?? card.sourceId].filter(Boolean).join(" · ")}
+                </option>
+              ))}
+            </select>
+            <div className="grid grid-cols-3 rounded-md border border-ink/15 bg-paper p-0.5">
+              {BANK_FLOW_FILTERS.map((filter) => (
+                <button
+                  key={filter.key}
+                  type="button"
+                  onClick={() => setFlowFilter(filter.key)}
+                  className={`rounded px-3 py-1.5 text-sm font-medium ${flowFilter === filter.key ? "bg-white text-ink shadow-sm" : "text-ink/50"}`}
+                >
+                  {filter.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        {(() => {
+          const period = filterTransactionsByDateRange(cardTransactions, dateRange);
+          const filtered = filterBankTransactions(period, search, cardFilter, flowFilter);
+          const sorted = [...filtered].sort((a, b) => (b.postedDate ?? b.authorizedAt ?? "").localeCompare(a.postedDate ?? a.authorizedAt ?? ""));
+          return (
+            <Table
+              bare
+              columns={["日期", "卡片", "說明", "交易對象", "金額"]}
+              rows={sorted.map((transaction) => [
+                transaction.postedDate
+                  ? formatDateTime(transaction.postedDate)
+                  : transaction.authorizedAt
+                    ? formatDateTime(transaction.authorizedAt)
+                    : "-",
+                transaction.accountName ?? transaction.accountId,
+                transaction.description ?? "-",
+                transaction.counterparty ?? "-",
+                <span className={transaction.amount > 0 ? "text-red-600" : "text-moss"}>
+                  {formatCurrency(transaction.amount, transaction.currency)}
+                </span>
+              ])}
+              empty="尚無刷卡交易。"
+            />
+          );
+        })()}
       </div>
     </section>
   );
@@ -4071,9 +4135,9 @@ function Metric({ label, value, icon }: { label: string; value: string; icon: Re
   );
 }
 
-function Table({ columns, rows, empty }: { columns: string[]; rows: ReactNode[][]; empty: string }) {
+function Table({ columns, rows, empty, bare }: { columns: string[]; rows: ReactNode[][]; empty: string; bare?: boolean }) {
   return (
-    <div className="overflow-hidden rounded-xl border border-ink/10 bg-white shadow-sm">
+    <div className={bare ? "overflow-hidden" : "overflow-hidden rounded-xl border border-ink/10 bg-white shadow-sm"}>
       <div className="hidden overflow-x-auto md:block">
         <table className="min-w-full divide-y divide-ink/10 text-left text-sm">
           <thead className="bg-paper">

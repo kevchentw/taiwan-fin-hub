@@ -57,7 +57,27 @@ async function scrapeWithBrowser(browserBinding: Fetcher, config: CtbcbankConfig
 
   try {
     await page.setViewport({ width: 1280, height: 800 });
-    await login(page, config);
+
+    const sessionValid =
+      config.sessionCookies &&
+      config.sessionExpiresAt &&
+      new Date(config.sessionExpiresAt) > new Date();
+
+    if (sessionValid) {
+      console.log("[ctbcbank] injecting session cookies, skipping login page");
+      const cookies = JSON.parse(config.sessionCookies!);
+      await page.setCookie(...cookies);
+      await page.goto(DEPOSIT_OVERVIEW_URL, { waitUntil: "load", timeout: 60000 });
+      const url = page.url();
+      if (!url.includes("/twrbc/")) {
+        console.log(`[ctbcbank] session expired or rejected url=${url} — falling back to password login`);
+        await login(page, config);
+      } else {
+        console.log(`[ctbcbank] session restored ok url=${url}`);
+      }
+    } else {
+      await login(page, config);
+    }
 
     console.log("[ctbcbank] collecting deposit accounts");
     const result = await scrapeDeposits(page, lookbackMonths);

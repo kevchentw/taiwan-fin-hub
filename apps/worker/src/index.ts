@@ -2,6 +2,7 @@ import {
   einvoiceConnector,
   parseConnectorConfig,
   parseCathaybkConfig,
+  parseCtbcbankConfig,
   parseEsunConfig,
   parseInvoiceConfig,
   parseTdccConfig,
@@ -10,6 +11,7 @@ import {
   TdccOtpExpiredError
 } from "@taiwan-fin-hub/connectors";
 import { createCathaybkConnector } from "./cathaybk";
+import { createCtbcbankConnector } from "./ctbcbank";
 import { createEsunConnector } from "./esun";
 import {
   type BankAccount,
@@ -109,6 +111,7 @@ const settingsBodySchema = z.object({
 const PUBLIC_FIELDS: Record<string, string[]> = {
   esun: ["lookbackMonths"],
   cathaybk: ["lookbackMonths"],
+  ctbcbank: ["lookbackMonths"],
   einvoice: ["periodsBack", "fetchDetails"]
 };
 
@@ -1115,6 +1118,10 @@ api.post("/connectors/cathaybk/sync", async (c) => {
   return syncRouteResponse(c, withManualSyncLock(c.env, "cathaybk", SYNC_SCOPE_ALL, () => syncCathaybk(c.env, "manual")));
 });
 
+api.post("/connectors/ctbcbank/sync", async (c) => {
+  return syncRouteResponse(c, withManualSyncLock(c.env, "ctbcbank", SYNC_SCOPE_ALL, () => syncCtbcbank(c.env, "manual")));
+});
+
 async function tdccSyncBody(c: Context<{ Bindings: Env; Variables: Variables }>) {
   return tdccSyncBodySchema.parse(await c.req.json().catch(() => ({})));
 }
@@ -1300,6 +1307,56 @@ async function syncCathaybk(env: Env, trigger: SyncTrigger): Promise<SyncOutcome
     ...bankBalanceSnapshots.map((s) => bankBalanceSnapshotStatement(env.DB, connectorId, s, now)),
     ...bankTransactions.map((t) => bankTransactionStatement(env.DB, connectorId, t, now)),
     ...creditCardBills.map((b) => creditCardBillStatement(env.DB, connectorId, b, now)),
+    ...(bankAccounts.length > 0 ? [linkCanonicalBankAccountsStatement(env.DB)] : [])
+  ];
+
+  if (result.cursor) {
+    const cursorState = JSON.parse(result.cursor) as Record<string, unknown>;
+    const updatedConfig = { ...config, ...cursorState };
+    statements.push(
+      env.DB.prepare(`UPDATE connector_settings SET encrypted_config = ?, sync_cursor = ?, updated_at = ? WHERE connector_id = ?`)
+        .bind(await encryptJson(updatedConfig, configEncryptionKey(env)), result.cursor, now, connectorId)
+    );
+  }
+
+  if (statements.length > 0) {
+    await env.DB.batch(statements);
+  }
+
+  if (bankBalanceSnapshots.length > 0) {
+    await rebuildBankDepositHistory(env.DB, [dateFromIso(now)]);
+  }
+
+  return {
+    success: true,
+    connectorId,
+    scope,
+    records: bankAccounts.length + bankBalanceSnapshots.length + bankTransactions.length,
+    cursorUpdated: Boolean(result.cursor && result.cursor !== settings.sync_cursor)
+  };
+}
+
+async function syncCtbcbank(env: Env, trigger: SyncTrigger): Promise<SyncOutcome> {
+  const connectorId = "ctbcbank";
+  const scope = "all";
+  const settings = await requireConnectorSettings(env.DB, connectorId);
+  const stored = await decryptJson<unknown>(settings.encrypted_config, configEncryptionKey(env));
+  const publicStored = settings.public_config ? JSON.parse(settings.public_config) : {};
+  const config = parseCtbcbankConfig({ ...(stored as object), ...publicStored });
+
+  console.log(`[sync] ${connectorId}/${scope}: starting trigger=${trigger} (cursor=${settings.sync_cursor ?? "none"})`);
+  const result = await createCtbcbankConnector(env.BROWSER).sync(config, settings.sync_cursor ?? undefined);
+
+  const bankAccounts = result.bankAccounts ?? [];
+  const bankBalanceSnapshots = result.bankBalanceSnapshots ?? [];
+  const bankTransactions = result.bankTransactions ?? [];
+  console.log(`[sync] ${connectorId}/${scope}: accounts=${bankAccounts.length} snapshots=${bankBalanceSnapshots.length} transactions=${bankTransactions.length}`);
+
+  const now = new Date().toISOString();
+  const statements: D1PreparedStatement[] = [
+    ...bankAccounts.map((a) => bankAccountStatement(env.DB, connectorId, a, now)),
+    ...bankBalanceSnapshots.map((s) => bankBalanceSnapshotStatement(env.DB, connectorId, s, now)),
+    ...bankTransactions.map((t) => bankTransactionStatement(env.DB, connectorId, t, now)),
     ...(bankAccounts.length > 0 ? [linkCanonicalBankAccountsStatement(env.DB)] : [])
   ];
 
@@ -1611,6 +1668,10 @@ async function runDueSyncJob(env: Env, job: SyncJobRow) {
     return syncCathaybk(env, "scheduled");
   }
 
+  if (job.connector_id === "ctbcbank") {
+    return syncCtbcbank(env, "scheduled");
+  }
+
   throw new NeedsUserActionError("Scheduled connector is not supported.");
 }
 
@@ -1855,6 +1916,7 @@ function invoiceLineItemStatement(
 // number, so only trailing digits are used from the account segment.
 const ESUN_BANK_CODE = "808";
 const CATHAYBK_BANK_CODE = "013";
+const CTBCBANK_BANK_CODE = "822";
 const TAIWAN_BANK_NAMES: Record<string, string> = {
   "004": "台灣銀行",
   "005": "土地銀行",
@@ -1911,6 +1973,10 @@ function deriveBankMatchKey(connectorId: ConnectorId, sourceId: string): { bankC
     const last4 = sourceId.split(":")[2]?.replace(/\D/g, "").slice(-4) ?? "";
     return { bankCode: CATHAYBK_BANK_CODE, last4: last4 || null };
   }
+  if (connectorId === "ctbcbank" && sourceId.startsWith("bank:ctbcbank:")) {
+    const last4 = sourceId.split(":")[2]?.replace(/\D/g, "").slice(-4) ?? "";
+    return { bankCode: CTBCBANK_BANK_CODE, last4: last4 || null };
+  }
   const match = sourceId.match(/^settlement:([^:]+):([^:]+)/);
   const last4 = match?.[2]?.replace(/\D/g, "").slice(-4) ?? "";
   return match ? { bankCode: match[1], last4: last4 || null } : { bankCode: null, last4: null };
@@ -1932,7 +1998,7 @@ function normalizeDepositDisplay<T extends BankDisplayRow>(row: T): T {
   const bankCode =
     row.bankCode ??
     settlement.bankCode ??
-    (row.connectorId === "esun" ? ESUN_BANK_CODE : row.connectorId === "cathaybk" ? CATHAYBK_BANK_CODE : undefined);
+    (row.connectorId === "esun" ? ESUN_BANK_CODE : row.connectorId === "cathaybk" ? CATHAYBK_BANK_CODE : row.connectorId === "ctbcbank" ? CTBCBANK_BANK_CODE : undefined);
   const accountLast5 = accountLast5FromSourceId(sourceId);
 
   return {
@@ -1951,6 +2017,9 @@ function parseBankAccountSource(sourceId: string): { bankCode?: string; account?
 
   const cathaybk = sourceId.match(/^bank:cathaybk:([^:]+)/);
   if (cathaybk) return { bankCode: CATHAYBK_BANK_CODE, account: cathaybk[1] };
+
+  const ctbcbank = sourceId.match(/^bank:ctbcbank:([^:]+)/);
+  if (ctbcbank) return { bankCode: CTBCBANK_BANK_CODE, account: ctbcbank[1] };
 
   return {};
 }
@@ -2018,14 +2087,14 @@ function linkCanonicalBankAccountsStatement(db: D1Database) {
     `UPDATE bank_accounts
     SET canonical_account_id = (
       SELECT direct.id FROM bank_accounts direct
-      WHERE direct.connector_id IN ('esun', 'cathaybk')
+      WHERE direct.connector_id IN ('esun', 'cathaybk', 'ctbcbank')
         AND direct.bank_code = bank_accounts.bank_code
         AND direct.account_last4 = bank_accounts.account_last4
         AND direct.currency = bank_accounts.currency
       ORDER BY direct.connector_id  -- deterministic tiebreak
       LIMIT 1
     )
-    WHERE connector_id NOT IN ('esun', 'cathaybk') AND bank_code IS NOT NULL AND account_last4 IS NOT NULL`
+    WHERE connector_id NOT IN ('esun', 'cathaybk', 'ctbcbank') AND bank_code IS NOT NULL AND account_last4 IS NOT NULL`
   );
 }
 

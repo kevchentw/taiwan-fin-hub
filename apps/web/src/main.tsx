@@ -55,7 +55,7 @@ interface ManualAssetHistoryEntry {
 }
 
 type View = "dashboard" | "invoices" | "investments" | "cards" | "bank" | "assets" | "settings";
-type ConnectorId = "einvoice" | "tdcc" | "esun" | "cathaybk";
+type ConnectorId = "einvoice" | "tdcc" | "esun" | "cathaybk" | "ctbcbank";
 type SyncTarget = "default" | "investments" | "bank" | "trades";
 
 interface Summary {
@@ -3557,6 +3557,12 @@ const connectorFields: Record<ConnectorId, ConnectorField[]> = {
     { key: "account", label: "用戶代號", type: "text" },
     { key: "password", label: "網銀密碼", type: "password" },
     { key: "lookbackMonths", label: "查詢期間（月）", type: "number", placeholder: "1（最多 24）" }
+  ],
+  ctbcbank: [
+    { key: "userId", label: "身分證字號", type: "text", placeholder: "A123456789" },
+    { key: "account", label: "用戶代號", type: "text" },
+    { key: "password", label: "網銀密碼", type: "password" },
+    { key: "lookbackMonths", label: "查詢期間（月）", type: "number", placeholder: "1（最多 6）" }
   ]
 };
 
@@ -3850,6 +3856,7 @@ function SettingsView({ api, demoMode }: { api: ApiClient; demoMode: boolean }) 
         <ConnectorPanel api={api} connectorId="tdcc" demoMode={demoMode} title="集保e存摺" />
         <ConnectorPanel api={api} connectorId="esun" demoMode={demoMode} title="玉山銀行" />
         <ConnectorPanel api={api} connectorId="cathaybk" demoMode={demoMode} title="國泰世華銀行" />
+        <ConnectorPanel api={api} connectorId="ctbcbank" demoMode={demoMode} title="中國信託銀行" />
         <ExchangeRatesPanel api={api} />
         <ClassificationRulesPanel api={api} />
       </section>
@@ -3962,7 +3969,7 @@ function ConnectorPanel({
       queryClient.invalidateQueries({ queryKey: ["invoice"] });
       return;
     }
-    if (connectorId === "esun" || connectorId === "cathaybk") {
+    if (connectorId === "esun" || connectorId === "cathaybk" || connectorId === "ctbcbank") {
       queryClient.invalidateQueries({ queryKey: ["bank"] });
       return;
     }

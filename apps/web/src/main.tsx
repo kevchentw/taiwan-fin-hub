@@ -535,6 +535,7 @@ function Dashboard({ api, onNavigate }: { api: ApiClient; onNavigate: (v: View) 
             <div className="divide-y divide-ink/8">
               {recentTxns.map((txn) => {
                 const date = txn.postedDate ?? txn.authorizedAt;
+                const formattedDate = formatDate(date);
                 const isCredit = txn.amount > 0;
                 return (
                   <div key={txn.id} className="flex items-center gap-3 px-5 py-3">
@@ -544,7 +545,7 @@ function Dashboard({ api, onNavigate }: { api: ApiClient; onNavigate: (v: View) 
                     <div className="min-w-0 flex-1">
                       <p className="truncate text-sm font-medium">{txn.description ?? txn.counterparty ?? "交易"}</p>
                       <p className="text-xs text-ink/45">
-                        {formatBankAccountName(txn) || txn.institutionName || ""}{date ? ` · ${formatDate(date)}` : ""}
+                        {formatBankAccountName(txn) || txn.institutionName || ""}{formattedDate ? ` · ${formattedDate}` : ""}
                       </p>
                     </div>
                     <p className={`shrink-0 text-sm font-semibold tabular-nums ${isCredit ? "text-emerald-600" : "text-red-500"}`}>
@@ -4513,18 +4514,33 @@ function bankAccountLast5(sourceId: string) {
 }
 
 function formatDateTime(value?: string) {
-  if (!value) {
-    return "";
-  }
+  const date = parseValidDate(value);
+  if (!date) return "";
+
   return new Intl.DateTimeFormat("zh-TW", {
     dateStyle: "medium",
     timeStyle: "short"
-  }).format(new Date(value));
+  }).format(date);
 }
 
 function formatDate(value?: string) {
-  if (!value) return "";
-  return new Intl.DateTimeFormat("zh-TW", { dateStyle: "short" }).format(new Date(value));
+  const date = parseValidDate(value);
+  if (!date) return "";
+
+  return new Intl.DateTimeFormat("zh-TW", { dateStyle: "short" }).format(date);
+}
+
+function parseValidDate(value?: string) {
+  if (!value) return undefined;
+
+  const date = new Date(value);
+  if (!Number.isNaN(date.getTime())) return date;
+
+  const datePrefix = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!datePrefix) return undefined;
+
+  const fallback = new Date(Number(datePrefix[1]), Number(datePrefix[2]) - 1, Number(datePrefix[3]));
+  return Number.isNaN(fallback.getTime()) ? undefined : fallback;
 }
 
 function messageFromError(error: unknown) {

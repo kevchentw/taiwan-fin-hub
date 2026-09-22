@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> 本專案不再維護, 請使用 https://github.com/TedLin1993/all-set-tw
+
+
 # Taiwan Fin Hub
 
 自架個人理財整合工具，將銀行、投資、信用卡、電子發票集中在同一個介面查看。

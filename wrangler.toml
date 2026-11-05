@@ -1,4 +1,4 @@
-name = "taiwan-fin-hub"
+name = "taiwan-fin-hub-private"
 main = "apps/worker/src/index.ts"
 compatibility_date = "2026-06-01"
 compatibility_flags = ["nodejs_compat"]
@@ -14,5 +14,5 @@ crons = ["*/10 * * * *"]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "taiwan-fin-hub"
+database_name = "taiwan-fin-hub-private"
 migrations_dir = "packages/db/migrations"
